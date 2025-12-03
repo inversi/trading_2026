@@ -1,0 +1,17 @@
+Папка
+cd /var/www/vhosts/inversi.org/trading_bot
+source .venv/bin/activate
+
+Проверка
+ps aux | grep bot.py
+
+Остановка
+pkill -f "python3 bot.py"
+kill -9 PID (замени PID)
+
+Запуск
+nohup python3 bot.py > bot.log 2>&1 &
+
+Логи
+ls -lh bot.log            # есть ли файл логов
+tail -f bot.log           # онлайн-просмотр
