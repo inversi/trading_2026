@@ -99,7 +99,7 @@ import numpy as np
 from dotenv import load_dotenv
 
 import logging
-from logging.handlers import RotatingFileHandler
+from logging.handlers import TimedRotatingFileHandler
 import pathlib
 
 # =========================
@@ -353,8 +353,17 @@ def setup_logging(base_dir: str = 'logs'):
     formatter = logging.Formatter('[%(asctime)s UTC] %(message)s')
     formatter.converter = time.gmtime  # force UTC for strftime
 
-    def make_handler(filename: str, level: int) -> RotatingFileHandler:
-        h = RotatingFileHandler(log_dir / filename, maxBytes=2_000_000, backupCount=5, encoding='utf-8')
+    def make_handler(filename: str, level: int) -> TimedRotatingFileHandler:
+        # Пишем в файл log_dir/filename, ротация по дням: каждые сутки создаётся новый файл
+        # Формат имён по умолчанию: app.log.YYYY-MM-DD, trades.log.YYYY-MM-DD и т.п.
+        h = TimedRotatingFileHandler(
+            log_dir / filename,
+            when="midnight",      # ротация в полночь по UTC (мы используем UTC в formatter)
+            interval=1,
+            backupCount=30,         # сколько дней логов хранить
+            encoding="utf-8",
+            utc=True                # чтобы ротация была привязана к UTC
+        )
         h.setLevel(level)
         h.setFormatter(formatter)
         return h
