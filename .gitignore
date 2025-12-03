@@ -4,6 +4,8 @@ venv/
 # питоновский мусор
 __pycache__/
 *.pyc
+Comm.txt
+history_dump.py
 
 # логи и истории
 logs/

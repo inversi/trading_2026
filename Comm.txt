@@ -1,13 +1,27 @@
+Server: AlexSofia@1980
+
+ssh stanislav@89.22.103.173
+cd /var/www/vhosts/inversi.org/traiding_2026
+source venv/bin/activate
+python bot.py
+
+
+--------------------
+
 Папка
 cd /var/www/vhosts/inversi.org/trading_bot
 source .venv/bin/activate
+nohup python3 bot.py > bot.log 2>&1 &
+tail -f bot.log 
+
 
 Проверка
+cd /var/www/vhosts/inversi.org/trading_bot
+source .venv/bin/activate
 ps aux | grep bot.py
 
 Остановка
 pkill -f "python3 bot.py"
-kill -9 PID (замени PID)
 
 Запуск
 nohup python3 bot.py > bot.log 2>&1 &
@@ -15,3 +29,6 @@ nohup python3 bot.py > bot.log 2>&1 &
 Логи
 ls -lh bot.log            # есть ли файл логов
 tail -f bot.log           # онлайн-просмотр
+
+
+
