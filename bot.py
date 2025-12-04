@@ -1384,7 +1384,14 @@ class BreakoutWithATRAndRSI:
         с разумными стоп/тейк уровнями, чтобы стратегия могла управлять и закрывать их."""
         for symbol in self.cfg.MARKETS:
             try:
-                base_qty = self.ex.base_free(symbol)
+                # Учитываем не только free, но и зарезервированный (used) объём,
+                # чтобы подхватывать позиции, которые целиком висят в ордерах.
+                bal = self.ex.ccxt.fetch_balance()
+                base = symbol.split('/')[0]
+                free = float((bal.get('free') or {}).get(base, 0.0) or 0.0)
+                used = float((bal.get('used') or {}).get(base, 0.0) or 0.0)
+                total = float((bal.get('total') or {}).get(base, free + used) or (free + used))
+                base_qty = total if total > 0 else (free + used)
             except Exception as e:
                 log(f"{symbol}: bootstrap — не удалось получить баланс базовой валюты: {e}")
                 continue
@@ -1788,14 +1795,19 @@ class BreakoutWithATRAndRSI:
                 try:
                     now_local = datetime.now().time()
                     if now_local.hour == 23 and now_local.minute >= 20:
-                        if last_close > pos.entry:
+                        try:
+                            # Берём актуальную цену по тикеру, чтобы не опираться только на последнюю закрытую свечу.
+                            live_px = self.ex.last_price(symbol)
+                        except Exception:
+                            live_px = last_close
+                        if live_px > pos.entry:
                             # Подробный лог по правилу конца дня: фиксируем приблизительный PnL и текущее время.
                             try:
-                                pnl_abs = (last_close - pos.entry) * pos.qty
+                                pnl_abs = (live_px - pos.entry) * pos.qty
                                 pnl_pct = (pnl_abs / max(1e-12, pos.entry * pos.qty)) * 100
                                 log_trade(
                                     f"{symbol}: end-of-day exit triggered at {now_local.strftime('%H:%M')} "
-                                    f"entry={fmt_float(pos.entry,8)} last={fmt_float(last_close,8)} qty={pos.qty:.8f} "
+                                    f"entry={fmt_float(pos.entry,8)} last={fmt_float(live_px,8)} qty={pos.qty:.8f} "
                                     f"pnl≈{pnl_abs:.2f} ({pnl_pct:.2f}%)"
                                 )
                             except Exception:
