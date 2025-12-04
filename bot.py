@@ -1392,6 +1392,7 @@ class BreakoutWithATRAndRSI:
                 used = float((bal.get('used') or {}).get(base, 0.0) or 0.0)
                 total = float((bal.get('total') or {}).get(base, free + used) or (free + used))
                 base_qty = total if total > 0 else (free + used)
+                base_qty_free = free
             except Exception as e:
                 log(f"{symbol}: bootstrap — не удалось получить баланс базовой валюты: {e}")
                 continue
@@ -1425,56 +1426,62 @@ class BreakoutWithATRAndRSI:
                 tp = entry + self.cfg.TP_R_MULT * (entry - stop)
 
             # Пытаемся автоматически поставить защитные ордера для ручных позиций (только в live)
-            qty_place = self.ex.round_qty(symbol, float(base_qty))
-            if self.cfg.MODE == 'live' and qty_place > 0:
-                try:
-                    last_px = self.ex.last_price(symbol)
-                    est_cost = qty_place * last_px
-                    min_cost = self.ex.min_order_cost_quote(symbol, fallback_price=last_px)
-                    if (min_cost is None) or (est_cost >= float(min_cost)):
-                        stop_price = float(stop)
-                        step = max(self.ex.price_step(symbol), 0.0) or (last_px * 0.001)
-                        minp = self.ex.min_price(symbol)
-                        # Ensure correct relationships for SELL OCO: tp > last, stop < last, stop_limit < stop
-                        stop_price = min(stop_price, last_px - step)
-                        stop_limit_price = max(minp, stop_price - step)
-                        raw_tp = float(tp) if tp else None
-                        tp_price = None
-                        if self.cfg.USE_TP and raw_tp is not None:
-                            tp_price = max(raw_tp, last_px + step, stop_price + step)
-                        # Round all to precision
-                        stop_price = float(self.ex.ccxt.price_to_precision(symbol, stop_price))
-                        stop_limit_price = float(self.ex.ccxt.price_to_precision(symbol, stop_limit_price))
-                        if tp_price is not None:
-                            tp_price = float(self.ex.ccxt.price_to_precision(symbol, tp_price))
-                        
-                        # Final sanity: enforce strict inequalities after rounding, without going below minimal price
-                        if tp_price is not None and not (tp_price > last_px and stop_price < last_px and stop_limit_price < stop_price):
-                            adj_stop = max(minp, stop_price - step)
-                            adj_sllim = max(minp, stop_limit_price - step)
-                            stop_price = float(self.ex.ccxt.price_to_precision(symbol, adj_stop))
-                            stop_limit_price = float(self.ex.ccxt.price_to_precision(symbol, adj_sllim))
-                            tp_price = float(self.ex.ccxt.price_to_precision(symbol, tp_price + step))
-                        if self.cfg.USE_TP and tp_price is not None and self.ex.has_oco:
-                            self.ex.create_oco_sell(symbol, qty_place, tp_price, stop_price, stop_limit_price)
+            qty_place = self.ex.round_qty(symbol, float(base_qty_free))
+            if self.cfg.MODE == 'live':
+                if qty_place <= 0:
+                    log(f"{symbol}: bootstrap — пропускаем постановку защитных ордеров, свободный остаток 0 (free={base_qty_free:.8f}, used={used:.8f})", True)
+                else:
+                    if qty_place < base_qty:
+                        log(f"{symbol}: bootstrap — ставим ордера только на свободный остаток free={qty_place:.8f} из total≈{base_qty:.8f}", True)
+                    try:
+                        last_px = self.ex.last_price(symbol)
+                        est_cost = qty_place * last_px
+                        min_cost = self.ex.min_order_cost_quote(symbol, fallback_price=last_px)
+                        if (min_cost is None) or (est_cost >= float(min_cost)):
+                            stop_price = float(stop)
+                            step = max(self.ex.price_step(symbol), 0.0) or (last_px * 0.001)
+                            minp = self.ex.min_price(symbol)
+                            # Ensure correct relationships for SELL OCO: tp > last, stop < last, stop_limit < stop
+                            stop_price = min(stop_price, last_px - step)
+                            stop_limit_price = max(minp, stop_price - step)
+                            raw_tp = float(tp) if tp else None
+                            tp_price = None
+                            if self.cfg.USE_TP and raw_tp is not None:
+                                tp_price = max(raw_tp, last_px + step, stop_price + step)
+                            # Round all to precision
+                            stop_price = float(self.ex.ccxt.price_to_precision(symbol, stop_price))
+                            stop_limit_price = float(self.ex.ccxt.price_to_precision(symbol, stop_limit_price))
+                            if tp_price is not None:
+                                tp_price = float(self.ex.ccxt.price_to_precision(symbol, tp_price))
+                            
+                            # Final sanity: enforce strict inequalities after rounding, without going below minimal price
+                            if tp_price is not None and not (tp_price > last_px and stop_price < last_px and stop_limit_price < stop_price):
+                                adj_stop = max(minp, stop_price - step)
+                                adj_sllim = max(minp, stop_limit_price - step)
+                                stop_price = float(self.ex.ccxt.price_to_precision(symbol, adj_stop))
+                                stop_limit_price = float(self.ex.ccxt.price_to_precision(symbol, adj_sllim))
+                                tp_price = float(self.ex.ccxt.price_to_precision(symbol, tp_price + step))
+                            if self.cfg.USE_TP and tp_price is not None and self.ex.has_oco:
+                                self.ex.create_oco_sell(symbol, qty_place, tp_price, stop_price, stop_limit_price)
+                            else:
+                                # OCO недоступен — ставим только SL. Отдельный TP не выставляем,
+                                # чтобы не резервировать двойной объём и не получать ошибку баланса.
+                                self.ex.create_stop_loss_limit(symbol, qty_place, stop_price, stop_limit_price)
+                                if self.cfg.USE_TP and tp_price is not None and not self.ex.has_oco:
+                                    log(f"{symbol}: OCO недоступен — TP не выставлен (только SL)")
+                            log(f"{symbol}: bootstrap — поставлены защитные ордера для ручной позиции qty={qty_place:.8f} sl≈{fmt_float(stop,8)} tp≈{fmt_float(tp if tp else 0,8) if self.cfg.USE_TP else 'None'}")
                         else:
-                            # OCO недоступен — ставим только SL. Отдельный TP не выставляем,
-                            # чтобы не резервировать двойной объём и не получать ошибку баланса.
-                            self.ex.create_stop_loss_limit(symbol, qty_place, stop_price, stop_limit_price)
-                            if self.cfg.USE_TP and tp_price is not None and not self.ex.has_oco:
-                                log(f"{symbol}: OCO недоступен — TP не выставлен (только SL)")
-                        log(f"{symbol}: bootstrap — поставлены защитные ордера для ручной позиции qty={qty_place:.8f} sl≈{fmt_float(stop,8)} tp≈{fmt_float(tp if tp else 0,8) if self.cfg.USE_TP else 'None'}")
-                    else:
-                        log(f"{symbol}: bootstrap — ручная позиция слишком мала для постановки ордеров (≈{est_cost:.2f} < min≈{float(min_cost):.2f})")
-                except Exception as e:
-                    log(f"{symbol}: bootstrap — не удалось поставить защитные ордера для ручной позиции: {e}")
+                            log(f"{symbol}: bootstrap — ручная позиция слишком мала для постановки ордеров (≈{est_cost:.2f} < min≈{float(min_cost):.2f})")
+                    except Exception as e:
+                        log(f"{symbol}: bootstrap — не удалось поставить защитные ордера для ручной позиции: {e}")
 
             # Округление для логов
             entry_str = fmt_float(entry, 8)
             stop_str = fmt_float(stop, 8)
             tp_str = fmt_float(tp, 8) if tp is not None else 'None'
 
-            self.positions[symbol] = Position(symbol, 'long', float(base_qty), float(entry), float(stop), float(tp) if tp else None)
+            tracked_qty = qty_place if qty_place > 0 else self.ex.round_qty(symbol, float(base_qty))
+            self.positions[symbol] = Position(symbol, 'long', float(tracked_qty), float(entry), float(stop), float(tp) if tp else None)
             log(f"{symbol}: bootstrap — обнаружен баланс {base_qty:.8f} {symbol.split('/')[0]}, позиция создана entry={entry_str} stop={stop_str} tp={tp_str}")
     """
     Стратегия (лонг-только, учебный пример):
