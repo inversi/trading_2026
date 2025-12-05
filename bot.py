@@ -1229,6 +1229,52 @@ class BreakoutWithATRAndRSI:
 
         return stop_price, stop_limit_price, tp_price
 
+    def _apply_exit_rules_by_pct(self, pos: Position, last_price: float) -> bool:
+        """Применяет процентные правила выхода для одной позиции:
+        - стоп-лосс при -25% от цены входа;
+        - внутри дня тейк-профит при +7%;
+        - в конце дня фиксация любой положительной доходности.
+
+        Возвращает True, если позиция была закрыта и дальнейшая обработка символа не нужна.
+        """
+        if pos is None or pos.qty <= 0 or pos.entry <= 0:
+            return False
+
+        pnl_pct = (last_price - pos.entry) / pos.entry
+
+        # 1) Стоп-лосс при -25% от цены входа: фиксируем убыток и увеличиваем счётчик убыточных сделок.
+        if pnl_pct <= -0.25:
+            self._cancel_position(pos, reason=f"stop_loss_-25pct pnl={pnl_pct:.4f}")
+            try:
+                self.losses_in_row += 1
+            except Exception:
+                pass
+            return True
+
+        # Текущее локальное время сервера (для правила конца дня)
+        now_local = datetime.now().time()
+
+        # 2) Внутридневной тейк-профит при +7% от цены входа: фиксация прибыли, сброс счётчика убыточных сделок.
+        if pnl_pct >= 0.07:
+            self._cancel_position(pos, reason=f"take_profit_intraday_+7pct pnl={pnl_pct:.4f}")
+            try:
+                self.losses_in_row = 0
+            except Exception:
+                pass
+            return True
+
+        # 3) В конце дня фиксируем любую положительную доходность.
+        # Здесь считаем «концом дня» период после 23:00 локального времени.
+        if pnl_pct > 0 and now_local.hour >= 23:
+            self._cancel_position(pos, reason=f"take_profit_eod_positive pnl={pnl_pct:.4f}")
+            try:
+                self.losses_in_row = 0
+            except Exception:
+                pass
+            return True
+
+        return False
+
     # На каждом тике сверяет желаемые уровни SL/TP с тем, что фактически
     # выставлено на бирже. Если OCO/стопы устарели или отсутствуют,
     # они переустанавливаются с учётом текущего ATR и размера позиции.
@@ -1827,49 +1873,24 @@ class BreakoutWithATRAndRSI:
             # стратегия не создаёт.
             pass
 
-            # Менеджмент открытой позиции: в текущей конфигурации без стоп-лосса
-            # позиция закрывается по тейк-профиту (TP), вручную или по правилу конца дня.
+            # Менеджмент открытой позиции: применяем процентные правила выхода
+            # (SL -25%, внутридневной TP +7%, фиксация плюса в конце дня).
             if symbol in self.positions:
                 pos = self.positions[symbol]
 
-                # Правило конца дня: после 23:20 (локальное время сервера) закрываем
-                # позицию, если она в плюсе (текущая цена выше цены входа).
+                # Берём актуальную рыночную цену для оценки PnL; при ошибке падаем обратно к last_close.
                 try:
-                    now_local = datetime.now().time()
-                    if now_local.hour == 23 and now_local.minute >= 20:
-                        try:
-                            # Берём актуальную цену по тикеру, чтобы не опираться только на последнюю закрытую свечу.
-                            live_px = self.ex.last_price(symbol)
-                        except Exception:
-                            live_px = last_close
-                        if live_px > pos.entry:
-                            # Подробный лог по правилу конца дня: фиксируем приблизительный PnL и текущее время.
-                            try:
-                                pnl_abs = (live_px - pos.entry) * pos.qty
-                                pnl_pct = (pnl_abs / max(1e-12, pos.entry * pos.qty)) * 100
-                                log_trade(
-                                    f"{symbol}: end-of-day exit triggered at {now_local.strftime('%H:%M')} "
-                                    f"entry={fmt_float(pos.entry,8)} last={fmt_float(live_px,8)} qty={pos.qty:.8f} "
-                                    f"pnl≈{pnl_abs:.2f} ({pnl_pct:.2f}%)"
-                                )
-                            except Exception:
-                                pass
-                            self._cancel_position(pos, 'end-of-day profit exit')
-                            # Позиция закрыта с прибылью — обнуляем счётчик убыточных сделок.
-                            self.losses_in_row = 0
-                            continue  # уже закрыли позицию, новые входы по этому символу не рассматриваем в этом тике
+                    live_px = self.ex.last_price(symbol)
                 except Exception:
-                    # В случае проблем с временем не мешаем остальной логике.
-                    pass
+                    live_px = last_close
 
-                # Обычное закрытие по тейк-профиту: если TP достигнут, фиксируем прибыль.
-                if pos.tp and last_close >= pos.tp:
-                    self._cancel_position(pos, 'take-profit hit')
-                    self.losses_in_row = 0
+                if self._apply_exit_rules_by_pct(pos, live_px):
+                    # Позиция уже закрыта одним из правил, новые входы по символу
+                    # в этом тике не рассматриваем.
+                    continue
 
-                # Стоп-лосс и трейлинг-стоп не используются, поэтому просто
-                # пропускаем новые входы по этому символу, пока позиция открыта.
-                continue  # skip new entries while in a position
+                # Пока позиция открыта, новые входы по этому символу не допускаются.
+                continue
 
             # Риск-контроль по серии убыточных сделок.
             if self.losses_in_row >= self.cfg.MAX_LOSSES_IN_ROW:
