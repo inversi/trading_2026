@@ -1254,8 +1254,8 @@ class BreakoutWithATRAndRSI:
         # Текущее локальное время сервера (для правила конца дня)
         now_local = datetime.now().time()
 
-        # 2) Внутридневной тейк-профит при +7% от цены входа: фиксация прибыли, сброс счётчика убыточных сделок.
-        if pnl_pct >= 0.07:
+        # 2) Внутридневной тейк-профит при +3% от цены входа: фиксация прибыли, сброс счётчика убыточных сделок.
+        if pnl_pct >= 0.03:
             self._cancel_position(pos, reason=f"take_profit_intraday_+7pct pnl={pnl_pct:.4f}", exit_price=last_price)
             try:
                 self.losses_in_row = 0
@@ -1846,22 +1846,33 @@ class BreakoutWithATRAndRSI:
                 qty_free = self.ex.base_free(pos.symbol)
                 qty_free = self.ex.round_qty(pos.symbol, qty_free)
                 if qty_free > 0:
-                    order = self.ex.create_market_sell(pos.symbol, qty_free)
-                    info = order if isinstance(order, dict) else {}
-                    filled_qty = _safe_float(info.get('filled'), info.get('amount'), info.get('info', {}).get('executedQty')) or qty_free
-                    fill_price = _safe_float(
-                        info.get('average'),
-                        info.get('price'),
-                        info.get('cost', 0) / filled_qty if filled_qty else None,
-                        info.get('info', {}).get('avgPrice'),
-                        info.get('info', {}).get('price')
-                    )
-                    if fill_price is None:
-                        fill_price = est_exit_px
-                    actual_pnl_quote = (fill_price - pos.entry) * filled_qty
-                    log_trade(
-                        f"FORCE_EXIT {pos.symbol} market_sell_all qty={qty_free:.8f} fill_px={fmt_float(fill_price,8)} pnl_quote={actual_pnl_quote:.4f} {quote_ccy}"
-                    )
+                    # Binance требует minNotional даже для принудительной продажи, поэтому
+                    # пропускаем попытку, если остаток слишком мал, чтобы избежать -1013.
+                    px_for_check = est_exit_px if est_exit_px is not None else self.ex.last_price(pos.symbol)
+                    min_cost = self.ex.min_order_cost_quote(pos.symbol, fallback_price=px_for_check)
+                    est_cost = qty_free * (px_for_check or 0.0)
+                    if (min_cost is not None) and est_cost > 0 and est_cost < float(min_cost):
+                        log(
+                            f"{pos.symbol}: free qty≈{qty_free:.8f} est_cost≈{est_cost:.2f} < min_notional≈{float(min_cost):.2f} — skip force-sell",
+                            True
+                        )
+                    else:
+                        order = self.ex.create_market_sell(pos.symbol, qty_free)
+                        info = order if isinstance(order, dict) else {}
+                        filled_qty = _safe_float(info.get('filled'), info.get('amount'), info.get('info', {}).get('executedQty')) or qty_free
+                        fill_price = _safe_float(
+                            info.get('average'),
+                            info.get('price'),
+                            info.get('cost', 0) / filled_qty if filled_qty else None,
+                            info.get('info', {}).get('avgPrice'),
+                            info.get('info', {}).get('price')
+                        )
+                        if fill_price is None:
+                            fill_price = est_exit_px
+                        actual_pnl_quote = (fill_price - pos.entry) * filled_qty
+                        log_trade(
+                            f"FORCE_EXIT {pos.symbol} market_sell_all qty={qty_free:.8f} fill_px={fmt_float(fill_price,8)} pnl_quote={actual_pnl_quote:.4f} {quote_ccy}"
+                        )
                 else:
                     log(f"{pos.symbol}: no free base balance to force-sell on exit", True)
             except Exception as e:
