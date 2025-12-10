@@ -71,18 +71,16 @@
 #   affordable                 — проверка, достаточно ли депозита для minNotional
 #   round_qty                  — округление количества по лимитам биржи
 #   create_market_buy/sell     — рыночные ордера
-#   create_limit_sell          — лимитный ордер на продажу (TP)
-#   create_stop_loss_limit     — стоп-лимитный ордер на продажу (SL)
-#   create_oco_sell            — создание OCO (TP + SL)
+#   create_limit_sell          — лимитный ордер на продажу (TP, используется в bootstrap)
+#   create_stop_loss_limit     — стоп-лимитный ордер на продажу (SL, используется в bootstrap)
+#   create_oco_sell            — создание OCO (TP + SL, используется в bootstrap)
 #   cancel_order/_all_orders   — отмена ордеров
 #
 # Стратегия BreakoutWithATRAndRSI:
 #   _signal                    — генерация сигнала на вход по пробою и фильтрам ATR/RSI/объёма
 #   _position_size             — расчёт размера позиции от заданного риска
-#   _place_orders              — выставление рыночного входа и защитных ордеров
+#   _place_orders              — рыночный вход + установка логических уровней стоп/TP (без биржевых защитных ордеров)
 #   _has_position_or_pending   — проверка существующих позиций и ожидающих ордеров
-#   _compute_protective_prices — расчёт уровней SL/TP с учётом трейлинг-стопа
-#   _reconcile_protective_orders — синхронизация биржевых SL/TP с логическими уровнями
 #   bootstrap_existing_positions — подключение уже открытых вручную позиций
 #   _cancel_position           — логическое закрытие позиции и принудительная продажа
 #   on_tick                    — один цикл стратегии (сигналы, управление позициями)
@@ -1231,57 +1229,6 @@ class BreakoutWithATRAndRSI:
 
         return False
 
-    # Расчёт уровней защитных ордеров (SL и TP) относительно цены входа и текущего логического стопа.
-    # В этой версии стоп берётся из текущего trailing stop (logical_stop), а TP вычисляется как entry + TP_R_MULT * (entry - stop).
-    def _compute_protective_prices(self, symbol: str, entry: float, logical_stop: float, last_price: float) -> Tuple[float, float, Optional[float]]:
-        """Расчёт биржевых уровней защитных ордеров (stop/stop_limit/tp) по логическому стопу.
-
-        Возвращает кортеж (stop_price, stop_limit_price, tp_price или None) на основе текущего логического стопа.
-
-        Все уровни корректируются под требования биржи (округление и строгие неравенства):
-        - entry         — цена входа
-        - logical_stop  — текущий «логический» уровень стопа (например, подтянутый трейлингом)
-        - last_price    — текущая рыночная цена
-        """
-        # Базовый уровень стопа берём из логического стопа (trailing), а не пересчитываем от ATR каждый раз.
-        stop = float(logical_stop)
-
-        # Если по какой-то причине стоп оказался выше текущей цены, немного отодвинем его ниже last_price.
-        step = max(self.ex.price_step(symbol), 0.0) or (max(last_price, 1e-12) * 0.001)
-        minp = self.ex.min_price(symbol)
-
-        # Не даём стопу опускаться ниже допустимой глубины: не глубже STOP_MAX_PCT от entry и не ниже минимальной цены.
-        max_drop = max(0.0, self.cfg.STOP_MAX_PCT)
-        min_stop_allowed = max(minp, float(entry) * (1.0 - max_drop))
-        stop = max(stop, min_stop_allowed)
-
-        stop_price = min(stop, last_price - step)
-        stop_limit_price = max(minp, stop_price - step)
-
-        # Тейк-профит считаем как entry + TP_R_MULT * R, где R = entry - stop.
-        tp_price = None
-        if self.cfg.USE_TP:
-            risk_per_unit = max(0.0, float(entry) - stop)
-            if risk_per_unit > 0:
-                raw_tp = float(entry) + self.cfg.TP_R_MULT * risk_per_unit
-                tp_price = max(raw_tp, last_price + step, stop_price + step)
-
-        # Округляем уровни по требованиям биржи
-        stop_price = float(self.ex.ccxt.price_to_precision(symbol, stop_price))
-        stop_limit_price = float(self.ex.ccxt.price_to_precision(symbol, stop_limit_price))
-        if tp_price is not None:
-            tp_price = float(self.ex.ccxt.price_to_precision(symbol, tp_price))
-
-        # Гарантируем строгие неравенства после округления, не опускаясь ниже минимальной цены.
-        if tp_price is not None and not (tp_price > last_price and stop_price < last_price and stop_limit_price < stop_price):
-            adj_stop = max(minp, stop_price - step)
-            adj_sllim = max(minp, stop_limit_price - step)
-            stop_price = float(self.ex.ccxt.price_to_precision(symbol, adj_stop))
-            stop_limit_price = float(self.ex.ccxt.price_to_precision(symbol, adj_sllim))
-            tp_price = float(self.ex.ccxt.price_to_precision(symbol, tp_price + step))
-
-        return stop_price, stop_limit_price, tp_price
-
     def _apply_exit_rules_by_pct(self, pos: Position, last_price: float) -> bool:
         """Правила выхода для позиции:
         - стоп-лосс при -25% от цены входа;
@@ -1333,154 +1280,6 @@ class BreakoutWithATRAndRSI:
 
         return False
 
-    # На каждом тике сверяет желаемые уровни SL/TP с тем, что фактически
-    # выставлено на бирже. Если OCO/стопы устарели или отсутствуют,
-    # они переустанавливаются с учётом текущего ATR и размера позиции.
-    def _reconcile_protective_orders(self, symbol: str, last_close: float, atr_val: float) -> None:
-        """Синхронизация логических уровней SL/TP со стопами/тейками на бирже.
-
-        В начале каждого тика проверяет открытые защитные ордера (SL/TP) и при необходимости
-        обновляет их: удаляет лишние, двигает уровни или создаёт заново."""
-        try:
-            open_orders = self.ex.fetch_open_orders(symbol)
-        except Exception:
-            open_orders = []
-
-        pos = self.positions.get(symbol)
-
-        # If no tracked position exists, cancel stray sell-protective orders to avoid dangling risk.
-        if pos is None:
-            for o in open_orders:
-                try:
-                    if str(o.get('side')).lower() == 'sell':
-                        oid = o.get('id') or o.get('orderId') or (o.get('info') or {}).get('orderId')
-                        if oid:
-                            self.ex.cancel_order(str(oid), symbol)
-                            log(f"{symbol}: отменён лишний ордер без позиции id={oid}")
-                except Exception:
-                    continue
-            return
-
-        # Compute desired prices from current context using trailing logical stop (pos.stop)
-        desired_sl, desired_sllim, desired_tp = self._compute_protective_prices(symbol, pos.entry, pos.stop, last_close)
-
-        # If OCO is unavailable on this account, avoid placing a separate TP order
-        # simultaneously with SL, because spot will reserve the full base amount
-        # for each sell order leading to insufficient balance. We'll manage TP in
-        # logic only and keep a hard SL on exchange.
-        if not self.ex.has_oco:
-            desired_tp = None
-
-        # Identify current SL/TP orders
-        sl_orders, tp_orders = [], []
-        for o in open_orders:
-            try:
-                if str(o.get('side')).lower() != 'sell':
-                    continue
-                info = o.get('info') or {}
-                stop_p = info.get('stopPrice')
-                price = o.get('price')
-                # Heuristics: stop-limit has stopPrice; TP is plain limit above price
-                if stop_p is not None:
-                    sl_orders.append(o)
-                else:
-                    try:
-                        if price is not None and float(price) > float(last_close):
-                            tp_orders.append(o)
-                    except Exception:
-                        pass
-            except Exception:
-                continue
-
-        step = max(self.ex.price_step(symbol), 0.0) or (max(last_close, 1e-12) * 0.001)
-
-        # Determine if changes are needed
-        def need_update_sl(o) -> bool:
-            try:
-                info = o.get('info') or {}
-                cur_stop = float(info.get('stopPrice'))
-                cur_limit = float(o.get('price')) if o.get('price') is not None else cur_stop - step
-                return (abs(cur_stop - desired_sl) > step/2) or (abs(cur_limit - desired_sllim) > step/2) or (cur_stop >= last_close) or (cur_limit >= cur_stop)
-            except Exception:
-                return True
-
-        def need_update_tp(o) -> bool:
-            try:
-                cur_price = float(o.get('price'))
-                return (desired_tp is None) or (abs(cur_price - desired_tp) > step/2) or (cur_price <= last_close)
-            except Exception:
-                return True
-
-        sl_needs_change = any(need_update_sl(o) for o in sl_orders) if sl_orders else True  # True if missing
-        tp_needs_change = False
-        if self.cfg.USE_TP:
-            tp_needs_change = (any(need_update_tp(o) for o in tp_orders) if tp_orders else (desired_tp is not None))
-
-        # If quantities on exchange differ from tracked, prefer tracked (rounded) qty
-        qty = self.ex.round_qty(symbol, float(pos.qty))
-        if qty <= 0:
-            return
-
-        # Check minNotional before trying to place
-        est_cost = qty * max(1e-12, float(last_close))
-        min_cost = self.ex.min_order_cost_quote(symbol, fallback_price=float(last_close))
-        if (min_cost is not None) and (est_cost < float(min_cost)):
-            # Too small to maintain protective orders — cancel existing
-            for o in sl_orders + tp_orders:
-                try:
-                    oid = o.get('id') or o.get('orderId') or (o.get('info') or {}).get('orderId')
-                    if oid:
-                        self.ex.cancel_order(str(oid), symbol)
-                except Exception:
-                    pass
-            log(f"{symbol}: отменены защитные ордера — позиция ниже minNotional")
-            return
-
-        # Apply updates
-        try:
-            if self.cfg.USE_TP and self.ex.has_oco and (sl_needs_change or tp_needs_change):
-                # cancel all existing sell orders and recreate OCO fresh
-                for o in sl_orders + tp_orders:
-                    try:
-                        oid = o.get('id') or o.get('orderId') or (o.get('info') or {}).get('orderId')
-                        if oid:
-                            self.ex.cancel_order(str(oid), symbol)
-                    except Exception:
-                        pass
-                self.ex.create_oco_sell(symbol, qty, desired_tp, desired_sl, desired_sllim)
-                log(f"{symbol}: OCO обновлён sl={fmt_float(desired_sl,8)} slLim={fmt_float(desired_sllim,8)} tp={fmt_float(desired_tp if desired_tp else 0,8)}")
-                return
-
-            # Otherwise, handle independently
-            if sl_needs_change:
-                for o in sl_orders:
-                    try:
-                        oid = o.get('id') or o.get('orderId') or (o.get('info') or {}).get('orderId')
-                        if oid:
-                            self.ex.cancel_order(str(oid), symbol)
-                    except Exception:
-                        pass
-                self.ex.create_stop_loss_limit(symbol, qty, desired_sl, desired_sllim)
-                log(f"{symbol}: SL обновлён sl={fmt_float(desired_sl,8)} slLim={fmt_float(desired_sllim,8)}")
-
-            # TP order only if OCO is supported
-            if self.cfg.USE_TP and self.ex.has_oco:
-                if tp_needs_change:
-                    for o in tp_orders:
-                        try:
-                            oid = o.get('id') or o.get('orderId') or (o.get('info') or {}).get('orderId')
-                            if oid:
-                                self.ex.cancel_order(str(oid), symbol)
-                        except Exception:
-                            pass
-                    if desired_tp is not None:
-                        self.ex.create_limit_sell(symbol, qty, desired_tp)
-                        log(f"{symbol}: TP обновлён tp={fmt_float(desired_tp,8)}")
-            else:
-                if self.cfg.USE_TP and not self.ex.has_oco:
-                    log(f"{symbol}: OCO недоступен — ставим только SL без отдельного TP, чтобы не резервировать двойной объём", True)
-        except Exception as e:
-            log(f"{symbol}: reconcile protective orders failed: {e}")
     # Bootstrap: поиск уже имеющихся спот-позиций по указанным символам.
     # Если на кошельке есть свободный остаток базовой валюты, бот создаёт
     # для него Position и (в live-режиме) пытается автоматически поставить
@@ -1615,17 +1414,14 @@ class BreakoutWithATRAndRSI:
         - На основе расстояния entry - stop вычисляется TP:
             tp = entry + TP_R_MULT * (entry - stop).
         - Внутренние уровни стопа и TP сохраняются в объекте Position и
-          используются для дальнейшего управления позицией.
+          используются для дальнейшего управления позицией; биржевые защитные
+          ордера при входе не ставятся (выход по логической цели/правилам).
 
       Защитные ордера на бирже:
-        - Фактические SL/TP ордера на бирже выставляются и обновляются не
-          в момент входа, а в отдельном шаге _reconcile_protective_orders,
-          который вызывается на каждом тике.
-        - Если аккаунт поддерживает OCO, ставится связка TP+SL (OCO-ордер).
-          В противном случае бот выставляет только стоп-лимит (SL), а TP
-          остаётся логическим и обрабатывается в коде.
-        - Все уровни проходятся через фильтры биржи (PRICE_FILTER,
-          PERCENT_PRICE_BY_SIDE, minNotional), чтобы избежать ошибок InvalidOrder.
+        - В текущей версии при входе биржевые SL/TP не ставятся; выходы выполняются
+          логически (market sell) по правилам TP/SL/EOD.
+        - Для уже открытых вручную позиций bootstrap может поставить защитные ордера
+          (OCO, если доступно; иначе стоп-лимит) при достаточном объёме.
 
       Дневные ограничения и риск-менеджмент:
         - Отслеживается дневная equity в котируемой валюте (по умолчанию EUR).
@@ -1983,10 +1779,8 @@ class BreakoutWithATRAndRSI:
             last_close = ctx['last_close']
             atr_val = ctx['atr']
 
-            # Ранее здесь происходила синхронизация защитных ордеров (SL/TP) на бирже.
-            # В текущей конфигурации без стоп-лосса эту логику отключаем: TP
-            # выставляется один раз при входе в позицию, а дополнительных стоп-ордеров
-            # стратегия не создаёт.
+            # Синхронизация биржевых SL/TP отключена: работаем только с логическими
+            # уровнями внутри стратегии, без постановки защитных ордеров на биржу.
             pass
 
             # Менеджмент открытой позиции: применяем правила выхода
