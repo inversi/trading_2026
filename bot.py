@@ -180,6 +180,7 @@ class Config:
     USE_TP: bool
     USE_OCO_WHEN_AVAILABLE: bool
     FIXED_STOP_EUR: Optional[float] = None  # fixed stop-loss distance in quote currency
+    STOP_MAX_PCT: float = 0.3  # максимально допустимая глубина стопа от цены входа (0.3 = -30%)
 
 # Структура для хранения информации об одной позиции.
 # В данном примере бот торгует только в лонг, поэтому side='long'.
@@ -243,6 +244,7 @@ def load_config() -> Config:
         USE_TP=parse_bool(os.getenv('USE_TP', 'true'), True),
         USE_OCO_WHEN_AVAILABLE=parse_bool(os.getenv('USE_OCO_WHEN_AVAILABLE', 'true'), True),
         FIXED_STOP_EUR=float(os.getenv('FIXED_STOP_EUR', '0') or 0.0),
+        STOP_MAX_PCT=float(os.getenv('STOP_MAX_PCT', '0.3')),
     )
     return cfg
 
@@ -1248,6 +1250,11 @@ class BreakoutWithATRAndRSI:
         step = max(self.ex.price_step(symbol), 0.0) or (max(last_price, 1e-12) * 0.001)
         minp = self.ex.min_price(symbol)
 
+        # Не даём стопу опускаться ниже допустимой глубины: не глубже STOP_MAX_PCT от entry и не ниже минимальной цены.
+        max_drop = max(0.0, self.cfg.STOP_MAX_PCT)
+        min_stop_allowed = max(minp, float(entry) * (1.0 - max_drop))
+        stop = max(stop, min_stop_allowed)
+
         stop_price = min(stop, last_price - step)
         stop_limit_price = max(minp, stop_price - step)
 
@@ -1309,9 +1316,14 @@ class BreakoutWithATRAndRSI:
                 pass
             return True
 
-        # 3) В конце дня фиксируем любую положительную доходность.
-        # Здесь считаем «концом дня» период после 23:00 локального времени.
+        # 3) В конце дня фиксируем прибыль, но не закрываем далёкий TP преждевременно.
+        # Закрываем после 23:00, если позиция в плюсе и (TP выключен или цели нет, или цена уже близка к TP).
         if pnl_pct > 0 and now_local.hour >= 23:
+            near_tp = True
+            if self.cfg.USE_TP and pos.tp is not None:
+                near_tp = last_price >= pos.tp * 0.98
+            if not near_tp:
+                return False
             self._cancel_position(pos, reason=f"take_profit_eod_positive pnl={pnl_pct:.4f}", exit_price=last_price)
             try:
                 self.losses_in_row = 0
@@ -1776,6 +1788,14 @@ class BreakoutWithATRAndRSI:
         # в объекте позиции. Биржевой TP не ставится — выход происходит по логической цели (market sell),
         # чтобы избегать ошибок minNotional/резерва баланса и держать контроль в коде.
         stop_virtual = entry - (self.cfg.FIXED_STOP_EUR if self.cfg.FIXED_STOP_EUR > 0 else self.cfg.ATR_K * atr_val)
+        # Ограничиваем глубину стопа: не глубже STOP_MAX_PCT и не ниже минимальной цены.
+        try:
+            minp = self.ex.min_price(symbol)
+        except Exception:
+            minp = 0.0
+        max_drop = max(0.0, self.cfg.STOP_MAX_PCT)
+        stop_floor = max(minp, entry * (1.0 - max_drop))
+        stop_virtual = max(stop_virtual, stop_floor)
         tp = None
         if self.cfg.USE_TP:
             tp = entry + self.cfg.TP_R_MULT * (entry - stop_virtual)
@@ -1832,6 +1852,13 @@ class BreakoutWithATRAndRSI:
 
         # 2) Пересчитываем виртуальный стоп и TP от фактической цены входа
         stop_virtual = filled_price - (self.cfg.FIXED_STOP_EUR if self.cfg.FIXED_STOP_EUR > 0 else self.cfg.ATR_K * atr_val)
+        try:
+            minp = self.ex.min_price(symbol)
+        except Exception:
+            minp = 0.0
+        max_drop = max(0.0, self.cfg.STOP_MAX_PCT)
+        stop_floor = max(minp, filled_price * (1.0 - max_drop))
+        stop_virtual = max(stop_virtual, stop_floor)
         tp_price = None
         if self.cfg.USE_TP:
             base_tp = filled_price + self.cfg.TP_R_MULT * (filled_price - stop_virtual)
@@ -1906,12 +1933,14 @@ class BreakoutWithATRAndRSI:
                             info.get('info', {}).get('avgPrice'),
                             info.get('info', {}).get('price')
                         )
-                        if fill_price is None:
-                            fill_price = est_exit_px
-                        actual_pnl_quote = (fill_price - pos.entry) * filled_qty
-                        log_trade(
-                            f"FORCE_EXIT {pos.symbol} market_sell_all qty={qty_free:.8f} fill_px={fmt_float(fill_price,8)} pnl_quote={actual_pnl_quote:.4f} {quote_ccy}"
-                        )
+                    if fill_price is None:
+                        fill_price = est_exit_px
+                    actual_pnl_quote = (fill_price - pos.entry) * filled_qty
+                    # Форс-продажа фиксирует остаток после логического EXIT; считаем это тех. очисткой, а не отдельной сделкой.
+                    log(
+                        f"{pos.symbol}: force-sold residual qty={qty_free:.8f} fill_px={fmt_float(fill_price,8)} pnl_quote={actual_pnl_quote:.4f} {quote_ccy}",
+                        True
+                    )
                 else:
                     log(f"{pos.symbol}: no free base balance to force-sell on exit", True)
             except Exception as e:
