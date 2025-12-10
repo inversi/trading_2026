@@ -1183,6 +1183,52 @@ class BreakoutWithATRAndRSI:
             pass
         return False
 
+    def _sync_position_after_tp(self, symbol: str, ref_price: float) -> bool:
+        """Проверяет, не закрылась ли позиция по TP/вручную на бирже: если базового остатка нет (или он пыль ниже minNotional)
+        и нет открытых ордеров, удаляет позицию из трекера и логирует выход."""
+        pos = self.positions.get(symbol)
+        if pos is None:
+            return False
+
+        # Текущий базовый остаток и открытые ордера
+        try:
+            bal = self.ex.ccxt.fetch_balance()
+            base = symbol.split('/')[0]
+            free = float((bal.get('free') or {}).get(base, 0.0) or 0.0)
+            used = float((bal.get('used') or {}).get(base, 0.0) or 0.0)
+            total = free + used
+        except Exception:
+            return False
+
+        try:
+            open_orders = self.ex.fetch_open_orders(symbol)
+        except Exception:
+            open_orders = []
+        if open_orders:
+            return False
+
+        # Если объём отсутствует или стал пылью ниже minNotional — считаем позицию закрытой (TP/ручной выход).
+        est_cost = total * max(1e-12, float(ref_price))
+        min_cost = self.ex.min_order_cost_quote(symbol, fallback_price=float(ref_price))
+        if total <= 0 or ((min_cost is not None) and est_cost < float(min_cost)):
+            exit_px = pos.tp if pos.tp is not None else ref_price
+            try:
+                quote = symbol.split('/')[1] if '/' in symbol else 'QUOTE'
+            except Exception:
+                quote = 'QUOTE'
+            pnl_quote = (exit_px - pos.entry) * pos.qty
+            log_trade(
+                f"EXIT {symbol} side=long reason=tp_or_manual_fill exit_px={fmt_float(exit_px,8)} pnl_quote={pnl_quote:.4f} {quote}"
+            )
+            self.positions.pop(symbol, None)
+            try:
+                self.losses_in_row = 0
+            except Exception:
+                pass
+            return True
+
+        return False
+
     # Расчёт уровней защитных ордеров (SL и TP) относительно цены входа и текущего логического стопа.
     # В этой версии стоп берётся из текущего trailing stop (logical_stop), а TP вычисляется как entry + TP_R_MULT * (entry - stop).
     def _compute_protective_prices(self, symbol: str, entry: float, logical_stop: float, last_price: float) -> Tuple[float, float, Optional[float]]:
@@ -1230,9 +1276,9 @@ class BreakoutWithATRAndRSI:
         return stop_price, stop_limit_price, tp_price
 
     def _apply_exit_rules_by_pct(self, pos: Position, last_price: float) -> bool:
-        """Применяет процентные правила выхода для одной позиции:
+        """Правила выхода для позиции:
         - стоп-лосс при -25% от цены входа;
-        - внутри дня тейк-профит при +7%;
+        - тейк-профит по логическому уровню pos.tp (если USE_TP);
         - в конце дня фиксация любой положительной доходности.
 
         Возвращает True, если позиция была закрыта и дальнейшая обработка символа не нужна.
@@ -1254,9 +1300,9 @@ class BreakoutWithATRAndRSI:
         # Текущее локальное время сервера (для правила конца дня)
         now_local = datetime.now().time()
 
-        # 2) Внутридневной тейк-профит при +3% от цены входа: фиксация прибыли, сброс счётчика убыточных сделок.
-        if pnl_pct >= 0.03:
-            self._cancel_position(pos, reason=f"take_profit_intraday_+7pct pnl={pnl_pct:.4f}", exit_price=last_price)
+        # 2) Тейк-профит по заранее рассчитанной цели (pos.tp), если включён USE_TP.
+        if self.cfg.USE_TP and pos.tp is not None and last_price >= pos.tp:
+            self._cancel_position(pos, reason=f"take_profit_hit tp={pos.tp:.8f} pnl={pnl_pct:.4f}", exit_price=last_price)
             try:
                 self.losses_in_row = 0
             except Exception:
@@ -1727,9 +1773,8 @@ class BreakoutWithATRAndRSI:
         #    постановки защитных ордеров.
         #
         # На этом шаге стоп-лосс и тейк-профит рассчитываются как логические уровни и сохраняются
-        # в объекте позиции. Фактические биржевые защитные ордера (SL/TP или OCO) выставляются
-        # и обновляются отдельно в _reconcile_protective_orders, чтобы учитывать требования
-        # биржи по ценовым фильтрам, minNotional и возможные изменения trailing-стопа.
+        # в объекте позиции. Биржевой TP не ставится — выход происходит по логической цели (market sell),
+        # чтобы избегать ошибок minNotional/резерва баланса и держать контроль в коде.
         stop_virtual = entry - (self.cfg.FIXED_STOP_EUR if self.cfg.FIXED_STOP_EUR > 0 else self.cfg.ATR_K * atr_val)
         tp = None
         if self.cfg.USE_TP:
@@ -1793,12 +1838,6 @@ class BreakoutWithATRAndRSI:
             step = max(self.ex.price_step(symbol), 0.0) or (filled_price * 0.001)
             tp_raw = max(base_tp, filled_price + step)
             tp_price = float(self.ex.ccxt.price_to_precision(symbol, tp_raw))
-
-            try:
-                # Ставим только лимитный TP, без стоп-лосса.
-                self.ex.create_limit_sell(symbol, qty_for_tp, tp_price)
-            except Exception as e:
-                log_error(f"{symbol}: could not place TP limit order", e)
 
         return Position(symbol, 'long', qty_for_tp, filled_price, stop_virtual, tp_price if tp_price is not None else None)
 
@@ -1921,10 +1960,14 @@ class BreakoutWithATRAndRSI:
             # стратегия не создаёт.
             pass
 
-            # Менеджмент открытой позиции: применяем процентные правила выхода
-            # (SL -25%, внутридневной TP +7%, фиксация плюса в конце дня).
+            # Менеджмент открытой позиции: применяем правила выхода
+            # (SL -25%, TP по логической цели pos.tp, фиксация плюса в конце дня).
             if symbol in self.positions:
                 pos = self.positions[symbol]
+
+                # Если TP/ручной выход уже исполнился на бирже (позиции нет и нет ордеров) — удаляем её из трекера.
+                if self._sync_position_after_tp(symbol, last_close):
+                    continue
 
                 # Берём актуальную рыночную цену для оценки PnL; при ошибке падаем обратно к last_close.
                 try:
