@@ -3,7 +3,7 @@
 # =============================================================
 # Описание
 # Этот скрипт — простой торговый бот для Binance (spot) на ccxt.
-# Он читает параметры из файла .env и по 1-минутным свечам ищет лонг-setup
+# Он читает параметры из файла .env и по 1-минутным свечам ищет лонг-сетап
 # (пробой максимума предыдущей свечи с фильтрами ATR и, при FAST_MODE, RSI на HTF).
 # Обязательно начните с MODE=paper и только после проверки переключайте на live.
 #
@@ -71,9 +71,9 @@
 #   affordable                 — проверка, достаточно ли депозита для minNotional
 #   round_qty                  — округление количества по лимитам биржи
 #   create_market_buy/sell     — рыночные ордера
-#   create_limit_sell          — лимитный ордер на продажу (TP, используется в bootstrap)
-#   create_stop_loss_limit     — стоп-лимитный ордер на продажу (SL, используется в bootstrap)
-#   create_oco_sell            — создание OCO (TP + SL, используется в bootstrap)
+#   create_limit_sell          — лимитный ордер на продажу (TP, используется при инициализации позиции)
+#   create_stop_loss_limit     — стоп-лимитный ордер на продажу (SL, используется при инициализации позиции)
+#   create_oco_sell            — создание OCO (TP + SL, используется при инициализации позиции)
 #   cancel_order/_all_orders   — отмена ордеров
 #
 # Стратегия BreakoutWithATRAndRSI:
@@ -120,7 +120,7 @@ def sma(series: pd.Series, period: int) -> pd.Series:
 # Возвращает значения от 0 до 100, где перекупленность/перепроданность
 # зависят от выбранных порогов.
 def rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    # Wilder's RSI
+    # RSI по Уайлдеру (сглаживание через EWMA)
     delta = series.diff()
     up = np.where(delta > 0, delta, 0.0)
     down = np.where(delta < 0, -delta, 0.0)
@@ -142,7 +142,7 @@ def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
         (high - prev_close).abs(),
         (low - prev_close).abs()
     ], axis=1).max(axis=1)
-    return tr.ewm(alpha=1/period, adjust=False).mean()  # Wilder's ATR
+    return tr.ewm(alpha=1/period, adjust=False).mean()  # ATR по Уайлдеру
 
 # =========================
 # Модели данных
@@ -174,11 +174,16 @@ class Config:
     EXCHANGE: str
     API_KEY: Optional[str]
     API_SECRET: Optional[str]
-    TP_R_MULT: float  # take-profit multiple of risk (R); default 2.0
+    TP_R_MULT: float
     USE_TP: bool
     USE_OCO_WHEN_AVAILABLE: bool
-    FIXED_STOP_EUR: Optional[float] = None  # fixed stop-loss distance in quote currency
-    STOP_MAX_PCT: float = 0.3  # максимально допустимая глубина стопа от цены входа (0.3 = -30%)
+    FIXED_STOP_EUR: Optional[float] = None
+    STOP_MAX_PCT: float = 0.3
+    # Новые настраиваемые параметры
+    TARGET_ENTRY_COST: float = 10.0
+    HARD_STOP_LOSS_PCT: float = 0.25
+    ENABLE_EOD_EXIT: bool = True
+    EOD_EXIT_HOUR: int = 23
 
 # Структура для хранения информации об одной позиции.
 # В данном примере бот торгует только в лонг, поэтому side='long'.
@@ -187,7 +192,7 @@ class Config:
 @dataclass
 class Position:
     symbol: str
-    side: str           # 'long' only in this example
+    side: str           # сторона сделки (в примере только 'long')
     qty: float
     entry: float
     stop: float
@@ -243,6 +248,10 @@ def load_config() -> Config:
         USE_OCO_WHEN_AVAILABLE=parse_bool(os.getenv('USE_OCO_WHEN_AVAILABLE', 'true'), True),
         FIXED_STOP_EUR=float(os.getenv('FIXED_STOP_EUR', '0') or 0.0),
         STOP_MAX_PCT=float(os.getenv('STOP_MAX_PCT', '0.3')),
+        TARGET_ENTRY_COST=float(os.getenv('TARGET_ENTRY_COST', '10.0')),
+        HARD_STOP_LOSS_PCT=float(os.getenv('HARD_STOP_LOSS_PCT', '0.25')),
+        ENABLE_EOD_EXIT=parse_bool(os.getenv('ENABLE_EOD_EXIT', 'true'), True),
+        EOD_EXIT_HOUR=int(os.getenv('EOD_EXIT_HOUR', '23')),
     )
     return cfg
 
@@ -319,7 +328,7 @@ def filter_markets_by_affordability(ex: "Exchange", markets: List[str], total_qu
             ok, need = ex.affordable(sym, total_quote_balance)
         except Exception as e:
             if verbose:
-                log(f"{sym}: affordability check failed with error: {e}")
+                log(f"{sym}: проверка доступности не удалась: {e}")
             continue
         if ok:
             tradable.append(sym)
@@ -352,9 +361,9 @@ def setup_logging(base_dir: str = 'logs'):
     log_dir = pathlib.Path(base_dir)
     log_dir.mkdir(parents=True, exist_ok=True)
 
-    # Common formatter with UTC time
+    # Общий форматтер с временем в UTC
     formatter = logging.Formatter('[%(asctime)s UTC] %(message)s')
-    formatter.converter = time.gmtime  # force UTC for strftime
+    formatter.converter = time.gmtime  # принудительно используем UTC при форматировании времени
 
     def make_handler(filename: str, level: int) -> TimedRotatingFileHandler:
         # Пишем в файл log_dir/filename, ротация по дням: каждые сутки создаётся новый файл
@@ -371,25 +380,25 @@ def setup_logging(base_dir: str = 'logs'):
         h.setFormatter(formatter)
         return h
 
-    # App/general logger
+    # Логгер общих событий приложения
     LOGGER_APP = logging.getLogger('app')
     LOGGER_APP.setLevel(logging.INFO)
     LOGGER_APP.handlers.clear()
     LOGGER_APP.addHandler(make_handler('app.log', logging.INFO))
 
-    # Trades logger (executions, entries/exits, order placement results)
+    # Логгер сделок (входы/выходы и результаты постановки ордеров)
     LOGGER_TRADES = logging.getLogger('trades')
     LOGGER_TRADES.setLevel(logging.INFO)
     LOGGER_TRADES.handlers.clear()
     LOGGER_TRADES.addHandler(make_handler('trades.log', logging.INFO))
 
-    # Errors logger
+    # Логгер ошибок
     LOGGER_ERRORS = logging.getLogger('errors')
     LOGGER_ERRORS.setLevel(logging.ERROR)
     LOGGER_ERRORS.handlers.clear()
     LOGGER_ERRORS.addHandler(make_handler('errors.log', logging.ERROR))
 
-    # Console handler for quick view
+    # Консольный вывод для оперативного просмотра
     console = logging.StreamHandler()
     console.setLevel(logging.INFO)
     console.setFormatter(formatter)
@@ -415,11 +424,11 @@ def log_trade(msg: str):
 def log_error(msg: str, exc: Exception = None):
     if LOGGER_ERRORS is not None:
         if exc is not None:
-            LOGGER_ERRORS.error(msg + f" | exception={exc}", exc_info=True)
+            LOGGER_ERRORS.error(msg + f" | исключение={exc}", exc_info=True)
         else:
             LOGGER_ERRORS.error(msg)
     else:
-        print(f"[{now_ts()}] ERROR: {msg}")
+        print(f"[{now_ts()}] ОШИБКА: {msg}")
 
 # =========================
 # Обёртка биржи (ccxt)
@@ -437,7 +446,7 @@ class Exchange:
         # Инициализация клиента ccxt для Binance spot. Загружаем рынки и
         # проверяем поддержку OCO (на некоторых аккаунтах/регионах может отличаться).
         if cfg.EXCHANGE != 'binance':
-            raise ValueError('Only binance is supported in this sample.')
+            raise ValueError('В этом примере поддерживается только Binance.')
         self.cfg = cfg
         self.ccxt = ccxt.binance({
             'apiKey': cfg.API_KEY or '',
@@ -445,7 +454,7 @@ class Exchange:
             'enableRateLimit': True,
             'options': {'defaultType': 'spot'}
         })
-        # Ensure unified symbols like 'PEPE/EUR' are loaded
+        # Загружаем унифицированные обозначения символов вида 'PEPE/EUR'
         self.markets = self.ccxt.load_markets()
         self.has_oco = bool(getattr(self.ccxt, 'has', {}).get('createOrderOCO', False))
 
@@ -460,7 +469,7 @@ class Exchange:
 
     # Оценка общего спот-баланса в выбранной котируемой валюте (по умолчанию EUR).
     # Перебираются все активы кошелька и для каждого ищется путь конверсии
-    # в quote (прямо, через USDT или через BTC). Нельзя использовать для
+    # в котируемую валюту (прямо, через USDT или через BTC). Нельзя использовать для
     # точной финансовой отчётности, но достаточно для risk-менеджмента.
     def balance_total_in_quote(self, quote: str = 'EUR') -> float:
         """Оценивает общий спот-баланс в выбранной котируемой валюте.
@@ -474,7 +483,7 @@ class Exchange:
         Используются балансы 'total' (free + used) спотового кошелька.
         """
         def _pair_last(base: str, q: str) -> Optional[float]:
-            # Try BASE/QUOTE, else QUOTE/BASE with inversion
+            # Пробуем пару BASE/QUOTE, иначе QUOTE/BASE с обращением курса
             pair = f"{base}/{q}"
             try:
                 t = self.ccxt.fetch_ticker(pair)
@@ -483,7 +492,7 @@ class Exchange:
                     return px
             except Exception:
                 pass
-            # Try reversed
+            # Пробуем обратную пару
             pair_rev = f"{q}/{base}"
             try:
                 t = self.ccxt.fetch_ticker(pair_rev)
@@ -497,17 +506,17 @@ class Exchange:
         def _asset_in_quote(asset: str, q: str) -> Optional[float]:
             if asset == q:
                 return 1.0
-            # 1) direct
+            # 1) прямой курс
             px = _pair_last(asset, q)
             if px is not None:
                 return px
-            # 2) via USDT
+            # 2) через USDT
             via = 'USDT'
             px1 = _pair_last(asset, via)
             px2 = _pair_last(via, q)
             if (px1 is not None) and (px2 is not None):
                 return px1 * px2
-            # 3) via BTC
+            # 3) через BTC
             via = 'BTC'
             px1 = _pair_last(asset, via)
             px2 = _pair_last(via, q)
@@ -531,7 +540,7 @@ class Exchange:
                 continue
             price_q = _asset_in_quote(asset, quote)
             if price_q is None:
-                # couldn't value this asset in the requested quote
+                # не удалось оценить актив в выбранной котируемой валюте
                 continue
             total_value += amount * price_q
         return float(total_value)
@@ -592,7 +601,7 @@ class Exchange:
     # По умолчанию собирает кандидатов автоматически, но можно передать явный список assets.
     def convert_small_balances_to_bnb(self, assets: Optional[List[str]] = None, max_value_btc: float = 0.001) -> dict:
         if self.cfg.MODE != 'live':
-            raise RuntimeError("Dust conversion доступен только в live-режиме.")
+            raise RuntimeError("Конвертация «пыли» доступна только в live-режиме.")
         if not hasattr(self.ccxt, 'sapiPostAssetDust'):
             raise RuntimeError("ccxt/binance не поддерживает sapiPostAssetDust на этом аккаунте.")
 
@@ -603,7 +612,7 @@ class Exchange:
         try:
             return self.ccxt.sapiPostAssetDust({'asset': assets})
         except Exception as e:
-            log_error("Dust conversion failed", e)
+            log_error("Не удалось выполнить конвертацию «пыли» в BNB", e)
             return {}
 
     # Свободный (не зарезервированный ордерами) баланс в выбранной
@@ -616,7 +625,7 @@ class Exchange:
             return 0.0
 
     # Максимальное количество базовой валюты, которое можно купить
-    # на весь доступный free-баланс quote с небольшим запасом safety,
+    # на весь доступный свободный баланс в котируемой валюте с небольшим запасом,
     # чтобы не упереться в ошибку недостатка средств.
     def max_buy_qty(self, symbol: str, safety: float = 0.995) -> float:
         quote = symbol.split('/')[1]
@@ -625,20 +634,20 @@ class Exchange:
         if px <= 0 or free_quote <= 0:
             return 0.0
         raw = (free_quote / px) * max(0.0, min(1.0, safety))
-        # If the calculated raw amount is non-positive, skip early
+        # Если расчётный объём неположительный — сразу пропускаем
         if raw <= 0:
             return 0.0
-        # Some markets (e.g. LINK/EUR) require the amount to be >= precision step.
-        # amount_to_precision may raise InvalidOrder if raw is too small; in that case
-        # we just report that we cannot buy anything meaningful.
+        # На части рынков (например, LINK/EUR) объём должен быть не меньше шага точности.
+        # amount_to_precision может выбросить InvalidOrder, если объём слишком мал;
+        # в этом случае просто сообщаем, что покупать нечего.
         try:
             return float(self.ccxt.amount_to_precision(symbol, raw))
         except Exception:
-            log(f"{symbol}: max_buy_qty amount_to_precision rejected raw={raw:.12g} — returning 0", True)
+            log(f"{symbol}: amount_to_precision для max_buy_qty отклонил расчётный объём={raw:.12g} — вернём 0", True)
             return 0.0
 
     # Свободный остаток базовой валюты по символу (например, PEPE для PEPE/EUR).
-    # Используется при bootstrap'е для обнаружения уже существующих ручных позиций.
+    # Используется при инициализации для обнаружения уже существующих ручных позиций.
     def base_free(self, symbol: str) -> float:
         """Свободный остаток базовой валюты по символу (например, PEPE для PEPE/EUR)."""
         base = symbol.split('/')[0]
@@ -649,7 +658,7 @@ class Exchange:
             return 0.0
 
     # Приблизительная средняя цена покупок по символу за заданный период.
-    # Нужна для того, чтобы при bootstrap'е задать разумный уровень entry,
+    # Нужна для того, чтобы при инициализации задать разумный уровень входа,
     # если позиция была открыта вручную до запуска бота.
     def avg_buy_price(self, symbol: str, lookback_days: int = 30) -> Optional[float]:
         """Оцениваем среднюю цену покупок по символу за последние N дней (spot).
@@ -733,7 +742,7 @@ class Exchange:
     def price_step(self, symbol: str) -> float:
         """Возвращает минимальный шаг цены (tickSize) для символа, предпочитая Binance PRICE_FILTER.tickSize."""
         m = self.market_info(symbol)
-        # Try exchange-specific filters first
+        # Сначала пробуем биржевые фильтры
         try:
             for f in m.get('info', {}).get('filters', []):
                 if f.get('filterType') == 'PRICE_FILTER':
@@ -742,14 +751,14 @@ class Exchange:
                         return ts
         except Exception:
             pass
-        # Fallback to precision-based step
+        # Затем пытаемся оценить шаг по precision
         prec = (m.get('precision') or {}).get('price')
         if isinstance(prec, int) and prec >= 0:
             try:
                 return float(10 ** (-prec))
             except Exception:
                 pass
-        # Last resort
+        # Последняя попытка
         lim_min = (m.get('limits', {}).get('price') or {}).get('min')
         try:
             return float(lim_min or 0.0)
@@ -869,30 +878,30 @@ class Exchange:
         min_amount = limits_amount.get('min')
         prec = (info.get('precision') or {}).get('amount')
 
-        # If the market requires integer amounts (precision == 0) and qty < 1, skip early
+        # Если рынок требует целочисленные объёмы (precision == 0) и qty < 1 — пропускаем
         try:
             if isinstance(prec, int) and prec == 0 and qty < 1:
-                log(f"{symbol}: qty {qty:.8f} < 1 and precision=0 (integer size required) — skip", True)
+                log(f"{symbol}: объём {qty:.8f} < 1 при precision=0 (нужны целые значения) — пропускаем", True)
                 return 0.0
         except Exception:
             pass
 
-        # First, try to round to exchange precision using ccxt helper
+        # Сначала пытаемся округлить к точности биржи через helper ccxt
         try:
             qty_rounded = float(self.ccxt.amount_to_precision(symbol, qty))
         except Exception:
-            # If helper complains (e.g., qty below precision step), skip gracefully
-            log(f"{symbol}: amount_to_precision rejected qty={qty:.12g} — skip", True)
+            # Если helper ругается (например, объём меньше шага), аккуратно пропускаем
+            log(f"{symbol}: amount_to_precision отклонил объём={qty:.12g} — пропускаем", True)
             return 0.0
 
-        # Enforce explicit minimum amount if provided by the market
+        # Применяем явный минимальный объём, если он указан
         if min_amount is not None:
             try:
                 min_amount = float(min_amount)
             except Exception:
                 min_amount = None
         if (min_amount is not None) and (qty_rounded < min_amount):
-            log(f"{symbol}: qty_rounded {qty_rounded:.8f} < min_amount {min_amount:.8f} — skip", True)
+            log(f"{symbol}: округлённый объём {qty_rounded:.8f} < минимального {min_amount:.8f} — пропускаем", True)
             return 0.0
 
         return float(qty_rounded)
@@ -1127,313 +1136,6 @@ def collect_history_last_month(ex: Exchange, symbols: Optional[List[str]] = None
 # и объёму. Управляет позициями, стопами, тейк-профитами и дневными лимитами
 # по просадке и серии убыточных сделок.
 class BreakoutWithATRAndRSI:
-    # Проверяет, есть ли уже позиция или открытые ордера по символу.
-    # Нужна, чтобы не открывать дубликаты позиций и не накладывать
-    # несколько независимых стопов/тейков на один и тот же инструмент.
-    def _has_position_or_pending(self, symbol: str) -> bool:
-        """True если уже есть позиция (в трекере или по балансу) или есть открытые ордера по символу."""
-        # Уже учтённая позиция
-        if symbol in self.positions and self.positions[symbol].qty > 0:
-            return True
-        # Остаток базовой монеты (например, при рестарте бота до bootstrap)
-        try:
-            qty = self.ex.base_free(symbol)
-            if qty > 0:
-                last = self.ex.last_price(symbol)
-                min_cost = self.ex.min_order_cost_quote(symbol, fallback_price=last)
-                # treat as a position only if the residual is tradable (>= minNotional)
-                if (min_cost is None) or (qty * last >= float(min_cost)):
-                    return True
-        except Exception:
-            pass
-        # Ожидающие ордера на символ (buy/sell/OCO legs)
-        try:
-            oo = self.ex.fetch_open_orders(symbol)
-            if oo:
-                # Оценка суммарной стоимости открытых ордеров (для диагностики и логов).
-                # Для лимитных/стоп-ордеров берём price или stopPrice, при отсутствии — last_price.
-                if self.cfg.VERBOSE:
-                    try:
-                        last_px = self.ex.last_price(symbol)
-                    except Exception:
-                        last_px = 0.0
-                    for o in oo:
-                        try:
-                            info = o.get('info') or {}
-                            side = str(o.get('side') or info.get('side') or '').lower()
-                            amount = o.get('amount')
-                            # Если amount=None, пробуем remaining / origQty из info
-                            if amount is None:
-                                amount = o.get('remaining') or info.get('origQty')
-                            amount_f = float(amount or 0.0)
-
-                            price = o.get('price') or info.get('price') or info.get('stopPrice') or last_px
-                            price_f = float(price or 0.0)
-
-                            est_cost = amount_f * price_f
-                            log(
-                                f"{symbol}: open order side={side} amount={fmt_float(amount_f,8)} "
-                                f"price≈{fmt_float(price_f,8)} est_cost≈{fmt_float(est_cost,2)}",
-                                True
-                            )
-                        except Exception:
-                            continue
-                return True
-        except Exception:
-            pass
-        return False
-
-    def _sync_position_after_tp(self, symbol: str, ref_price: float) -> bool:
-        """Проверяет, не закрылась ли позиция по TP/вручную на бирже: если базового остатка нет (или он пыль ниже minNotional)
-        и нет открытых ордеров, удаляет позицию из трекера и логирует выход."""
-        pos = self.positions.get(symbol)
-        if pos is None:
-            return False
-
-        # Текущий базовый остаток и открытые ордера
-        try:
-            bal = self.ex.ccxt.fetch_balance()
-            base = symbol.split('/')[0]
-            free = float((bal.get('free') or {}).get(base, 0.0) or 0.0)
-            used = float((bal.get('used') or {}).get(base, 0.0) or 0.0)
-            total = free + used
-        except Exception:
-            return False
-
-        try:
-            open_orders = self.ex.fetch_open_orders(symbol)
-        except Exception:
-            open_orders = []
-        if open_orders:
-            return False
-
-        # Если объём отсутствует или стал пылью ниже minNotional — считаем позицию закрытой (TP/ручной выход).
-        est_cost = total * max(1e-12, float(ref_price))
-        min_cost = self.ex.min_order_cost_quote(symbol, fallback_price=float(ref_price))
-        if total <= 0 or ((min_cost is not None) and est_cost < float(min_cost)):
-            exit_px = pos.tp if pos.tp is not None else ref_price
-            try:
-                quote = symbol.split('/')[1] if '/' in symbol else 'QUOTE'
-            except Exception:
-                quote = 'QUOTE'
-            pnl_quote = (exit_px - pos.entry) * pos.qty
-            log_trade(
-                f"EXIT {symbol} side=long reason=tp_or_manual_fill exit_px={fmt_float(exit_px,8)} pnl_quote={pnl_quote:.4f} {quote}"
-            )
-            self.positions.pop(symbol, None)
-            try:
-                self.losses_in_row = 0
-            except Exception:
-                pass
-            return True
-
-        return False
-
-    def _apply_exit_rules_by_pct(self, pos: Position, last_price: float) -> bool:
-        """Правила выхода для позиции:
-        - стоп-лосс при -25% от цены входа;
-        - тейк-профит по логическому уровню pos.tp (если USE_TP);
-        - в конце дня фиксация любой положительной доходности.
-
-        Возвращает True, если позиция была закрыта и дальнейшая обработка символа не нужна.
-        """
-        if pos is None or pos.qty <= 0 or pos.entry <= 0:
-            return False
-
-        pnl_pct = (last_price - pos.entry) / pos.entry
-
-        # 1) Стоп-лосс при -25% от цены входа: фиксируем убыток и увеличиваем счётчик убыточных сделок.
-        if pnl_pct <= -0.25:
-            self._cancel_position(pos, reason=f"stop_loss_-25pct pnl={pnl_pct:.4f}", exit_price=last_price)
-            try:
-                self.losses_in_row += 1
-            except Exception:
-                pass
-            return True
-
-        # Текущее локальное время сервера (для правила конца дня)
-        now_local = datetime.now().time()
-
-        # 2) Тейк-профит по заранее рассчитанной цели (pos.tp), если включён USE_TP.
-        if self.cfg.USE_TP and pos.tp is not None and last_price >= pos.tp:
-            self._cancel_position(pos, reason=f"take_profit_hit tp={pos.tp:.8f} pnl={pnl_pct:.4f}", exit_price=last_price)
-            try:
-                self.losses_in_row = 0
-            except Exception:
-                pass
-            return True
-
-        # 3) В конце дня фиксируем прибыль, но не закрываем далёкий TP преждевременно.
-        # Закрываем после 23:00, если позиция в плюсе и (TP выключен или цели нет, или цена уже близка к TP).
-        if pnl_pct > 0 and now_local.hour >= 23:
-            near_tp = True
-            if self.cfg.USE_TP and pos.tp is not None:
-                near_tp = last_price >= pos.tp * 0.98
-            if not near_tp:
-                return False
-            self._cancel_position(pos, reason=f"take_profit_eod_positive pnl={pnl_pct:.4f}", exit_price=last_price)
-            try:
-                self.losses_in_row = 0
-            except Exception:
-                pass
-            return True
-
-        return False
-
-    # Bootstrap: поиск уже имеющихся спот-позиций по указанным символам.
-    # Если на кошельке есть свободный остаток базовой валюты, бот создаёт
-    # для него Position и (в live-режиме) пытается автоматически поставить
-    # защитные ордера. Это позволяет подключить бота к уже открытым ручным
-    # сделкам.
-    def bootstrap_existing_positions(self):
-        """Сканирует свободные остатки базовых валют для всех символов и, если они есть, добавляет их как активные позиции
-        с разумными стоп/тейк уровнями, чтобы стратегия могла управлять и закрывать их."""
-        for symbol in self.cfg.MARKETS:
-            try:
-                # Учитываем не только free, но и зарезервированный (used) объём,
-                # чтобы подхватывать позиции, которые целиком висят в ордерах.
-                bal = self.ex.ccxt.fetch_balance()
-                base = symbol.split('/')[0]
-                free = float((bal.get('free') or {}).get(base, 0.0) or 0.0)
-                used = float((bal.get('used') or {}).get(base, 0.0) or 0.0)
-                total = float((bal.get('total') or {}).get(base, free + used) or (free + used))
-                base_qty = total if total > 0 else (free + used)
-                base_qty_free = free
-            except Exception as e:
-                log(f"{symbol}: bootstrap — не удалось получить баланс базовой валюты: {e}")
-                continue
-            if base_qty <= 0:
-                continue
-
-            # Проверка minNotional на случай пыли
-            last = self.ex.last_price(symbol)
-            min_cost = self.ex.min_order_cost_quote(symbol, fallback_price=last)
-            est_cost = base_qty * last
-            if (min_cost is not None) and (est_cost < float(min_cost)):
-                log(f"{symbol}: bootstrap — остаток слишком мал для ордера (≈{est_cost:.2f} < min≈{float(min_cost):.2f})")
-                continue
-
-            # Данные для ATR/TP/SL
-            try:
-                tf_df = self.ex.fetch_ohlcv(symbol, self.cfg.TIMEFRAME, max(60, self.cfg.LOOKBACK))
-            except Exception as e:
-                log(f"{symbol}: bootstrap — не удалось загрузить OHLCV: {e}")
-                continue
-            df = tf_df.copy()
-            df['atr'] = atr(df, 14)
-            last_row = df.iloc[-1]
-            atr_val = float(last_row['atr'])
-            entry = self.ex.avg_buy_price(symbol) or last
-
-            # Начальные уровни (как в _place_orders)
-            stop = entry - self.cfg.ATR_K * atr_val
-            tp = None
-            if self.cfg.USE_TP:
-                tp = entry + self.cfg.TP_R_MULT * (entry - stop)
-
-            # Пытаемся автоматически поставить защитные ордера для ручных позиций (только в live)
-            qty_place = self.ex.round_qty(symbol, float(base_qty_free))
-            if self.cfg.MODE == 'live':
-                if qty_place <= 0:
-                    log(f"{symbol}: bootstrap — пропускаем постановку защитных ордеров, свободный остаток 0 (free={base_qty_free:.8f}, used={used:.8f})", True)
-                else:
-                    if qty_place < base_qty:
-                        log(f"{symbol}: bootstrap — ставим ордера только на свободный остаток free={qty_place:.8f} из total≈{base_qty:.8f}", True)
-                    try:
-                        last_px = self.ex.last_price(symbol)
-                        est_cost = qty_place * last_px
-                        min_cost = self.ex.min_order_cost_quote(symbol, fallback_price=last_px)
-                        if (min_cost is None) or (est_cost >= float(min_cost)):
-                            stop_price = float(stop)
-                            step = max(self.ex.price_step(symbol), 0.0) or (last_px * 0.001)
-                            minp = self.ex.min_price(symbol)
-                            # Ensure correct relationships for SELL OCO: tp > last, stop < last, stop_limit < stop
-                            stop_price = min(stop_price, last_px - step)
-                            stop_limit_price = max(minp, stop_price - step)
-                            raw_tp = float(tp) if tp else None
-                            tp_price = None
-                            if self.cfg.USE_TP and raw_tp is not None:
-                                tp_price = max(raw_tp, last_px + step, stop_price + step)
-                            # Round all to precision
-                            stop_price = float(self.ex.ccxt.price_to_precision(symbol, stop_price))
-                            stop_limit_price = float(self.ex.ccxt.price_to_precision(symbol, stop_limit_price))
-                            if tp_price is not None:
-                                tp_price = float(self.ex.ccxt.price_to_precision(symbol, tp_price))
-                            
-                            # Final sanity: enforce strict inequalities after rounding, without going below minimal price
-                            if tp_price is not None and not (tp_price > last_px and stop_price < last_px and stop_limit_price < stop_price):
-                                adj_stop = max(minp, stop_price - step)
-                                adj_sllim = max(minp, stop_limit_price - step)
-                                stop_price = float(self.ex.ccxt.price_to_precision(symbol, adj_stop))
-                                stop_limit_price = float(self.ex.ccxt.price_to_precision(symbol, adj_sllim))
-                                tp_price = float(self.ex.ccxt.price_to_precision(symbol, tp_price + step))
-                            if self.cfg.USE_TP and tp_price is not None and self.ex.has_oco:
-                                self.ex.create_oco_sell(symbol, qty_place, tp_price, stop_price, stop_limit_price)
-                            else:
-                                # OCO недоступен — ставим только SL. Отдельный TP не выставляем,
-                                # чтобы не резервировать двойной объём и не получать ошибку баланса.
-                                self.ex.create_stop_loss_limit(symbol, qty_place, stop_price, stop_limit_price)
-                                if self.cfg.USE_TP and tp_price is not None and not self.ex.has_oco:
-                                    log(f"{symbol}: OCO недоступен — TP не выставлен (только SL)")
-                            log(f"{symbol}: bootstrap — поставлены защитные ордера для ручной позиции qty={qty_place:.8f} sl≈{fmt_float(stop,8)} tp≈{fmt_float(tp if tp else 0,8) if self.cfg.USE_TP else 'None'}")
-                        else:
-                            log(f"{symbol}: bootstrap — ручная позиция слишком мала для постановки ордеров (≈{est_cost:.2f} < min≈{float(min_cost):.2f})")
-                    except Exception as e:
-                        log(f"{symbol}: bootstrap — не удалось поставить защитные ордера для ручной позиции: {e}")
-
-            # Округление для логов
-            entry_str = fmt_float(entry, 8)
-            stop_str = fmt_float(stop, 8)
-            tp_str = fmt_float(tp, 8) if tp is not None else 'None'
-
-            tracked_qty = qty_place if qty_place > 0 else self.ex.round_qty(symbol, float(base_qty))
-            self.positions[symbol] = Position(symbol, 'long', float(tracked_qty), float(entry), float(stop), float(tp) if tp else None)
-            log(f"{symbol}: bootstrap — обнаружен баланс {base_qty:.8f} {symbol.split('/')[0]}, позиция создана entry={entry_str} stop={stop_str} tp={tp_str}")
-    """
-    Стратегия (лонг-только, учебный пример):
-      Вход (на младшем ТФ, обычно 1m):
-        - Последняя свеча закрылась выше SMA20.
-        - Пробой максимума предыдущей свечи (last.close > prev.high).
-        - ATR% в диапазоне [ATR_PCT_MIN, ATR_PCT_MAX].
-        - При включённом FAST_MODE дополнительно проверяются:
-          * RSI на старшем ТФ (FAST_HTF) — должен быть не ниже FAST_RSI_MIN.
-          * Объём текущей свечи на младшем ТФ — не ниже SMA(объёма, FAST_MIN_VOL_SMA).
-
-      Размер позиции:
-        - В текущей реализации размер позиции рассчитывается не от RISK_PCT,
-          а от фиксированной целевой стоимости входа в котируемой валюте
-          (по умолчанию ≈10 EUR на сделку, см. _position_size).
-        - RISK_PCT оставлен в конфиге на будущее как возможный альтернативный
-          режим расчёта объёма (риск от equity).
-
-      Стоп-лосс и тейк-профит:
-        - При открытии позиции считается логический (виртуальный) стоп:
-            * либо entry - ATR_K * ATR,
-            * либо entry - FIXED_STOP_EUR, если FIXED_STOP_EUR > 0
-              (интерпретируется как смещение цены, а не как риск в EUR).
-        - На основе расстояния entry - stop вычисляется TP:
-            tp = entry + TP_R_MULT * (entry - stop).
-        - Внутренние уровни стопа и TP сохраняются в объекте Position и
-          используются для дальнейшего управления позицией; биржевые защитные
-          ордера при входе не ставятся (выход по логической цели/правилам).
-
-      Защитные ордера на бирже:
-        - В текущей версии при входе биржевые SL/TP не ставятся; выходы выполняются
-          логически (market sell) по правилам TP/SL/EOD.
-        - Для уже открытых вручную позиций bootstrap может поставить защитные ордера
-          (OCO, если доступно; иначе стоп-лимит) при достаточном объёме.
-
-      Дневные ограничения и риск-менеджмент:
-        - Отслеживается дневная equity в котируемой валюте (по умолчанию EUR).
-        - MAX_DAILY_DD_PCT ограничивает максимально допустимую дневную
-          просадку; при её превышении новые входы блокируются до следующего дня.
-        - Параметр MAX_LOSSES_IN_ROW используется в on_tick для остановки
-          входов после серии убыточных сделок.
-
-      ВАЖНО: код приведён в образовательных целях. Перед реальной торговлей
-      обязательно тестируйте бота в paper-режиме, проверяйте логи, ордера,
-      точность расчётов и учитывайте комиссии, спред и скольжение.
-    """
     def __init__(self, cfg: Config, ex: Exchange):
         # Сохраняем конфиг и обёртку биржи, инициализируем состояние стратегии:
         # открытые позиции, дневную точку отсчёта по equity и счётчик
@@ -1446,393 +1148,303 @@ class BreakoutWithATRAndRSI:
         self.losses_in_row: int = 0
         self.current_date: date = date.today()
 
-    # Сброс дневных ограничений при смене календарного дня:
-    # точка отсчёта по equity и счётчик подряд идущих убыточных сделок.
+    def _get_base_free_from_balances(self, symbol: str, balances: dict) -> float:
+        """Извлекает свободный баланс базовой валюты из уже загруженного словаря балансов."""
+        base = symbol.split('/')[0]
+        try:
+            return float(balances.get('free', {}).get(base, 0.0) or 0.0)
+        except Exception:
+            return 0.0
+
+    def _get_quote_free_from_balances(self, symbol: str, balances: dict) -> float:
+        """Извлекает свободный баланс котируемой валюты из уже загруженного словаря балансов."""
+        quote = symbol.split('/')[1]
+        try:
+            return float(balances.get('free', {}).get(quote, 0.0) or 0.0)
+        except Exception:
+            return 0.0
+
+    # Проверяет, есть ли уже позиция или открытые ордера по символу.
+    def _has_position_or_pending(self, symbol: str, balances: dict, open_orders: List[dict]) -> bool:
+        """Возвращает истину, если уже есть позиция (в трекере или по балансу) или есть открытые ордера по символу."""
+        # 1. Уже учтённая позиция
+        if symbol in self.positions and self.positions[symbol].qty > 0:
+            return True
+        # 2. Остаток базовой монеты (из pre-fetched balances)
+        try:
+            qty = self._get_base_free_from_balances(symbol, balances)
+            if qty > 0:
+                last = self.ex.last_price(symbol)
+                min_cost = self.ex.min_order_cost_quote(symbol, fallback_price=last)
+                if (min_cost is None) or (qty * last >= float(min_cost)):
+                    return True
+        except Exception:
+            pass
+        # 3. Ожидающие ордера на символ (из pre-fetched list)
+        if open_orders:
+            if self.cfg.VERBOSE:
+                log(f"{symbol}: пропуск — найдены открытые ордера: {len(open_orders)}")
+            return True
+        return False
+
+    def _sync_position_after_tp(self, symbol: str, ref_price: float, balances: dict, open_orders: List[dict]) -> bool:
+        """Проверяет, не закрылась ли позиция по TP/вручную на бирже."""
+        pos = self.positions.get(symbol)
+        if pos is None:
+            return False
+
+        base = symbol.split('/')[0]
+        free = float((balances.get('free') or {}).get(base, 0.0) or 0.0)
+        used = float((balances.get('used') or {}).get(base, 0.0) or 0.0)
+        total = free + used
+
+        if open_orders:
+            return False
+
+        est_cost = total * max(1e-12, float(ref_price))
+        min_cost = self.ex.min_order_cost_quote(symbol, fallback_price=float(ref_price))
+        if total <= 0 or ((min_cost is not None) and est_cost < float(min_cost)):
+            exit_px = pos.tp if pos.tp is not None else ref_price
+            quote = symbol.split('/')[1] if '/' in symbol else 'КОТИРОВКА'
+            pnl_quote = (exit_px - pos.entry) * pos.qty
+            log_trade(f"ВЫХОД {symbol} направление=лонг причина=тейк_или_ручное закрытие цена={fmt_float(exit_px,8)} результат={pnl_quote:.4f} {quote}")
+            self.positions.pop(symbol, None)
+            self.losses_in_row = 0
+            return True
+
+        return False
+
+    def _apply_exit_rules_by_pct(self, pos: Position, last_price: float) -> bool:
+        """Правила выхода для позиции."""
+        if pos is None or pos.qty <= 0 or pos.entry <= 0:
+            return False
+
+        pnl_pct = (last_price - pos.entry) / pos.entry
+
+        if pnl_pct <= -self.cfg.HARD_STOP_LOSS_PCT:
+            reason = f"жесткий_стоп_{self.cfg.HARD_STOP_LOSS_PCT*100:.0f}% результат={pnl_pct:.4f}"
+            self._cancel_position(pos, reason=reason, exit_price=last_price)
+            self.losses_in_row += 1
+            return True
+
+        if self.cfg.USE_TP and pos.tp is not None and last_price >= pos.tp:
+            self._cancel_position(pos, reason=f"тейк_достигнут тейк={pos.tp:.8f} результат={pnl_pct:.4f}", exit_price=last_price)
+            self.losses_in_row = 0
+            return True
+
+        if self.cfg.ENABLE_EOD_EXIT and pnl_pct > 0 and datetime.now().time().hour >= self.cfg.EOD_EXIT_HOUR:
+            near_tp = not (self.cfg.USE_TP and pos.tp is not None) or (last_price >= pos.tp * 0.98)
+            if near_tp:
+                self._cancel_position(pos, reason=f"выход_в_конце_дня результат={pnl_pct:.4f}", exit_price=last_price)
+                self.losses_in_row = 0
+                return True
+
+        return False
+
+    def bootstrap_existing_positions(self):
+        """Сканирует свободные остатки базовых валют для всех символов и, если они есть, добавляет их как активные позиции."""
+        log("Подхватываем уже существующие позиции...")
+        for symbol in self.cfg.MARKETS:
+            try:
+                base_qty = self.ex.base_free(symbol)
+                if base_qty <= 0:
+                    continue
+
+                last = self.ex.last_price(symbol)
+                min_cost = self.ex.min_order_cost_quote(symbol, fallback_price=last)
+                if min_cost is not None and (base_qty * last < float(min_cost)):
+                    log(f"{symbol}: инициализация — остаток {base_qty} считается пылью, пропускаем.")
+                    continue
+
+                tf_df = self.ex.fetch_ohlcv(symbol, self.cfg.TIMEFRAME, max(60, self.cfg.LOOKBACK))
+                df = tf_df.copy()
+                df['atr'] = atr(df, 14)
+                atr_val = float(df.iloc[-1]['atr'])
+                entry = self.ex.avg_buy_price(symbol) or last
+
+                stop = entry - self.cfg.ATR_K * atr_val
+                tp = entry + self.cfg.TP_R_MULT * (entry - stop) if self.cfg.USE_TP else None
+
+                self.positions[symbol] = Position(symbol, 'long', base_qty, entry, stop, tp)
+                log(f"{symbol}: инициализация — обнаружено {base_qty} {symbol.split('/')[0]}, создана позиция вход={fmt_float(entry, 8)} стоп={fmt_float(stop, 8)}")
+            except Exception as e:
+                log_error(f"{symbol}: не удалось инициализировать символ", e)
+    
+    def __init__(self, cfg: Config, ex: Exchange):
+        self.cfg = cfg
+        self.ex = ex
+        self.positions: Dict[str, Position] = {}
+        self.daily_start_equity_eur: Optional[float] = None
+        self.losses_in_row: int = 0
+        self.current_date: date = date.today()
+
     def _reset_daily_limits_if_new_day(self):
         today = date.today()
         if today != self.current_date:
             self.current_date = today
             self.daily_start_equity_eur = None
             self.losses_in_row = 0
+            log("Новый день — сбрасываем дневные лимиты.")
 
-    # Гарантирует, что дневная базовая величина equity рассчитана.
-    # Используется для контроля дневной просадки (MAX_DAILY_DD_PCT).
     def _ensure_daily_equity_baseline(self, quote='EUR'):
         if self.daily_start_equity_eur is None:
             try:
                 self.daily_start_equity_eur = self.ex.balance_total_in_quote(quote)
             except Exception:
-                # If we cannot fetch balance (paper mode), fall back to last known equity
                 self.daily_start_equity_eur = 0.0
 
-    # Проверяет, не превышен ли дневной лимит просадки.
-    # Если просадка больше MAX_DAILY_DD_PCT, новые входы блокируются
-    # до следующего календарного дня.
     def _check_daily_dd_limit(self, quote='EUR') -> bool:
         self._ensure_daily_equity_baseline(quote)
         try:
             current = self.ex.balance_total_in_quote(quote)
         except Exception:
-            # Assume not breached if cannot fetch
             return True
         if self.daily_start_equity_eur == 0:
             return True
         dd = (current - self.daily_start_equity_eur) / self.daily_start_equity_eur
-        return dd >= -self.cfg.MAX_DAILY_DD_PCT * 1.001  # small buffer
+        return dd >= -self.cfg.MAX_DAILY_DD_PCT
 
-    # Генерация сигнала на вход в лонг.
-    # На младшем ТФ (TIMEFRAME, обычно 1m):
-    #  - последний close выше SMA20
-    #  - пробой максимума предыдущей свечи (last.close > prev.high)
-    #  - ATR% в пределах [ATR_PCT_MIN, ATR_PCT_MAX]
-    # При включённом FAST_MODE дополнительно:
-    #  - RSI на старшем ТФ (FAST_HTF) >= FAST_RSI_MIN
-    #  - текущий объём >= SMA объёма за FAST_MIN_VOL_SMA свечей.
-    # Возвращает флаг will_long и контекст ctx для логирования.
     def _signal(self, symbol: str, tf_df: pd.DataFrame, htf_df: Optional[pd.DataFrame]) -> Tuple[bool, Dict]:
-        # Считаем индикаторы на 1m: SMA20, ATR (Wilder), ATR% и средний объём.
         df = tf_df.copy()
         df['sma20'] = sma(df['close'], 20)
         df['atr'] = atr(df, 14)
         df['atr_pct'] = df['atr'] / df['close']
         df['vol_sma'] = sma(df['volume'], max(2, self.cfg.FAST_MIN_VOL_SMA))
 
-        # Базовый сигнал пробоя: последняя свеча закрылась выше SMA20 и выше максимума предыдущей свечи.
-        prev = df.iloc[-2]
-        last = df.iloc[-1]
+        prev, last = df.iloc[-2], df.iloc[-1]
         cond_breakout = (last['close'] > last['sma20']) and (last['close'] > prev['high'])
-
-        # Фильтр по волатильности: слишком низкая/высокая волатильность отбрасывает вход.
-        atr_ok = (last['atr_pct'] >= self.cfg.ATR_PCT_MIN) and (last['atr_pct'] <= self.cfg.ATR_PCT_MAX)
-
-        # Дополнительные фильтры FAST (HTF RSI и объём на 1m относительно своей SMA).
+        atr_ok = self.cfg.ATR_PCT_MIN <= last['atr_pct'] <= self.cfg.ATR_PCT_MAX
+        
+        rsi_ok, vol_ok = True, True
         if self.cfg.FAST_MODE and htf_df is not None:
             hdf = htf_df.copy()
             hdf['rsi'] = rsi(hdf['close'], 14)
             rsi_ok = hdf['rsi'].iloc[-1] >= self.cfg.FAST_RSI_MIN
             vol_ok = last['volume'] >= (df['vol_sma'].iloc[-1] if not np.isnan(df['vol_sma'].iloc[-1]) else 0)
-        else:
-            rsi_ok = True
-            vol_ok = True
 
-        # Итоговый флаг входа: все условия должны выполниться.
         will_long = bool(cond_breakout and atr_ok and rsi_ok and vol_ok)
-        ctx = {
-            'last_close': float(last['close']),
-            'prev_high': float(prev['high']),
-            'atr': float(last['atr']),
-            'atr_pct': float(last['atr_pct']),
-            'rsi_ok': bool(rsi_ok),
-            'vol_ok': bool(vol_ok),
-            'cond_breakout': bool(cond_breakout),
-            'atr_ok': bool(atr_ok),
-        }
+        ctx = {'last_close': float(last['close']), 'prev_high': float(prev['high']), 'atr': float(last['atr']), 'atr_pct': float(last['atr_pct']), 'rsi_ok': rsi_ok, 'vol_ok': vol_ok, 'cond_breakout': cond_breakout, 'atr_ok': atr_ok}
         return will_long, ctx
 
-    # Расчёт размера позиции от фиксированной суммы входа в котируемой валюте.
-    # В текущей конфигурации бот всегда старается открыть сделку примерно на 10 EUR,
-    # независимо от ширины стопа/волатильности. ATR здесь может использоваться для расчёта
-    # виртуального стопа и TP, но не влияет на объём.
-    def _position_size(self, symbol: str, entry: float, atr_val: float, quote='EUR') -> float:
-        # ФИКСИРОВАННЫЙ РАЗМЕР СДЕЛКИ: целевая стоимость позиции ≈ 10 EUR.
-        target_cost = 10.0  # EUR
-
+    def _position_size(self, symbol: str, entry: float, balances: dict) -> float:
+        target_cost = self.cfg.TARGET_ENTRY_COST
         if entry <= 0:
             return 0.0
-
-        # Базовый объём по целевой сумме сделки (без учёта биржевых лимитов)
+        
         qty_raw = target_cost / float(entry)
-
-        # Ограничение сверху по доступному свободному балансу котируемой валюты
-        qty_cap_balance = self.ex.max_buy_qty(symbol, 0.995)
+        
+        free_quote = self._get_quote_free_from_balances(symbol, balances)
+        px = self.ex.last_price(symbol)
+        qty_cap_balance = (free_quote / px) * 0.995 if px > 0 and free_quote > 0 else 0.0
+        
         qty = min(qty_raw, qty_cap_balance)
-
-        # Early check against explicit min amount to avoid precision errors
-        try:
-            info = self.ex.market_info(symbol)
-            limits_amount = (info.get('limits') or {}).get('amount') or {}
-            min_amount = limits_amount.get('min')
-            if min_amount is not None:
-                min_amount = float(min_amount)
-                if qty < min_amount:
-                    log(f"{symbol}: proposed qty {qty:.8f} < min_amount {min_amount:.8f} — skip position sizing", True)
-                    return 0.0
-        except Exception:
-            pass
-
         qty = self.ex.round_qty(symbol, qty)
 
-        # If rounding/limits reduce qty below the allowed minimum, skip this trade
-        if qty <= 0:
-            return 0.0
+        if qty <= 0: return 0.0
 
-        # Проверка минимальной стоимости ордера (minNotional)
-        last = max(1e-12, float(entry))
-        est_cost = qty * last
-        min_cost = self.ex.min_order_cost_quote(symbol, fallback_price=last)
-        if (min_cost is not None) and (est_cost < float(min_cost)):
+        min_cost = self.ex.min_order_cost_quote(symbol, fallback_price=entry)
+        if min_cost is not None and (qty * entry < float(min_cost)):
             return 0.0
         return qty
 
     def _place_orders(self, symbol: str, qty: float, entry: float, atr_val: float) -> Optional[Position]:
-        # Выставление ордеров для нового входа:
-        #  - в paper-режиме — создаётся только виртуальная Position с логическим стопом и TP;
-        #  - в live — отправляется рыночный ордер на покупку (market buy), без мгновенной
-        #    постановки защитных ордеров.
-        #
-        # На этом шаге стоп-лосс и тейк-профит рассчитываются как логические уровни и сохраняются
-        # в объекте позиции. Биржевой TP не ставится — выход происходит по логической цели (market sell),
-        # чтобы избегать ошибок minNotional/резерва баланса и держать контроль в коде.
         stop_virtual = entry - (self.cfg.FIXED_STOP_EUR if self.cfg.FIXED_STOP_EUR > 0 else self.cfg.ATR_K * atr_val)
-        # Ограничиваем глубину стопа: не глубже STOP_MAX_PCT и не ниже минимальной цены.
-        try:
-            minp = self.ex.min_price(symbol)
-        except Exception:
-            minp = 0.0
-        max_drop = max(0.0, self.cfg.STOP_MAX_PCT)
-        stop_floor = max(minp, entry * (1.0 - max_drop))
+        minp = self.ex.min_price(symbol)
+        stop_floor = max(minp, entry * (1.0 - self.cfg.STOP_MAX_PCT))
         stop_virtual = max(stop_virtual, stop_floor)
-        tp = None
-        if self.cfg.USE_TP:
-            tp = entry + self.cfg.TP_R_MULT * (entry - stop_virtual)
-
-        # Подробный комментарий в лог: как именно рассчитаны виртуальный стоп и TP.
-        # Это помогает понять, почему TP может выглядеть «далёким» от входа,
-        # особенно когда FIXED_STOP_EUR интерпретируется как смещение цены.
-        if self.cfg.VERBOSE:
-            try:
-                risk_per_unit = entry - stop_virtual
-                log(
-                    f"{symbol}: расчёт уровней для входа — entry={fmt_float(entry, 8)}, "
-                    f"virtual_stop={fmt_float(stop_virtual, 8)}, расстояние_R={fmt_float(risk_per_unit, 8)}, "
-                    f"TP_R_MULT={self.cfg.TP_R_MULT:.3f}, tp={fmt_float(tp if tp is not None else 0.0, 8)} "
-                    f"(FIXED_STOP_EUR интерпретируется как смещение цены, а не как риск в EUR)",
-                    True
-                )
-            except Exception:
-                # В случае любых проблем с форматированием не мешаем основной логике входа.
-                pass
+        tp = entry + self.cfg.TP_R_MULT * (entry - stop_virtual) if self.cfg.USE_TP else None
 
         if self.cfg.MODE == 'paper':
-            # В paper-режиме храним виртуальный стоп для расчётов, но логически
-            # позиция закрывается только по TP или вручную.
             return Position(symbol, 'long', qty, entry, stop_virtual, tp)
 
-        # LIVE
-        # Safety checks: free balance and minNotional before отправки ордера
-        quote_ccy = symbol.split('/')[1] if '/' in symbol else 'EUR'
-        free_quote = self.ex.quote_free(quote_ccy)
-        est_cost = float(qty) * float(entry)
-        min_cost = self.ex.min_order_cost_quote(symbol, fallback_price=float(entry))
-        log(f"{symbol}: try market buy qty={qty:.8f}, price≈{entry:.8g}, cost≈{est_cost:.2f} {quote_ccy}, free≈{free_quote:.2f} {quote_ccy}, min_cost≈{0 if min_cost is None else float(min_cost):.2f}", True)
-        if qty <= 0 or (min_cost is not None and est_cost < float(min_cost)) or est_cost > free_quote * 0.999:
-            log(f"{symbol}: skip buy — qty/cost not feasible (min_cost/free check)", True)
-            return None
-
-        # 1) Рыночная покупка
+        # live-режим
         buy = self.ex.create_market_buy(symbol, qty)
         filled_price = float(buy.get('average', buy.get('price', entry)) or entry)
+        
+        # Пересчитываем уровни исходя из фактической цены исполнения
+        stop_final = filled_price - (self.cfg.FIXED_STOP_EUR if self.cfg.FIXED_STOP_EUR > 0 else self.cfg.ATR_K * atr_val)
+        stop_final = max(stop_final, filled_price * (1.0 - self.cfg.STOP_MAX_PCT))
+        tp_final = filled_price + self.cfg.TP_R_MULT * (filled_price - stop_final) if self.cfg.USE_TP else None
 
-        # После исполнения market buy реальный доступный объём базовой валюты
-        # может быть чуть меньше из-за комиссий. Поэтому для постановки TP и
-        # учёта позиции используем фактический free-баланс, а не исходный qty.
-        try:
-            base_free_after = self.ex.base_free(symbol)
-            qty_for_tp = self.ex.round_qty(symbol, base_free_after)
-        except Exception:
-            qty_for_tp = self.ex.round_qty(symbol, qty)
+        return Position(symbol, 'long', float(buy['filled']), filled_price, stop_final, tp_final)
 
-        if qty_for_tp <= 0:
-            log(f"{symbol}: qty_for_tp <= 0 после market buy — позиция не будет открыта", True)
-            return None
-
-        # 2) Пересчитываем виртуальный стоп и TP от фактической цены входа
-        stop_virtual = filled_price - (self.cfg.FIXED_STOP_EUR if self.cfg.FIXED_STOP_EUR > 0 else self.cfg.ATR_K * atr_val)
-        try:
-            minp = self.ex.min_price(symbol)
-        except Exception:
-            minp = 0.0
-        max_drop = max(0.0, self.cfg.STOP_MAX_PCT)
-        stop_floor = max(minp, filled_price * (1.0 - max_drop))
-        stop_virtual = max(stop_virtual, stop_floor)
-        tp_price = None
-        if self.cfg.USE_TP:
-            base_tp = filled_price + self.cfg.TP_R_MULT * (filled_price - stop_virtual)
-            step = max(self.ex.price_step(symbol), 0.0) or (filled_price * 0.001)
-            tp_raw = max(base_tp, filled_price + step)
-            tp_price = float(self.ex.ccxt.price_to_precision(symbol, tp_raw))
-
-        return Position(symbol, 'long', qty_for_tp, filled_price, stop_virtual, tp_price if tp_price is not None else None)
-
-    # Закрытие позиции в контексте стратегии: удаление из трекера и запись
-    # события в лог. Фактическое закрытие на бирже происходит за счёт
-    # исполнения защитных ордеров. В live-режиме дополнительно пытаемся
-    # продать весь доступный остаток базовой валюты рыночным ордером.
     def _cancel_position(self, pos: Position, reason: str, exit_price: Optional[float] = None):
-        def _safe_float(*vals) -> Optional[float]:
-            for v in vals:
-                try:
-                    if v is None:
-                        continue
-                    return float(v)
-                except Exception:
-                    continue
-            return None
-
-        quote_ccy = pos.symbol.split('/')[1] if '/' in pos.symbol else 'QUOTE'
-
-        # Оценка прибыли/убытка в котируемой валюте (обычно EUR)
-        est_exit_px = exit_price
-        if est_exit_px is None:
-            try:
-                est_exit_px = self.ex.last_price(pos.symbol)
-            except Exception:
-                est_exit_px = None
-        if est_exit_px is None or est_exit_px <= 0:
-            est_exit_px = pos.entry
+        quote_ccy = pos.symbol.split('/')[1]
+        est_exit_px = exit_price or self.ex.last_price(pos.symbol)
         est_pnl_quote = (est_exit_px - pos.entry) * pos.qty
-
-        log_trade(
-            f"EXIT {pos.symbol} side=long reason={reason} exit_px={fmt_float(est_exit_px,8)} pnl_quote={est_pnl_quote:.4f} {quote_ccy}"
-        )
+        log_trade(f"ВЫХОД {pos.symbol} направление=лонг причина={reason} цена={fmt_float(est_exit_px,8)} результат={est_pnl_quote:.4f} {quote_ccy}")
 
         if self.cfg.MODE == 'live':
-            # 1) Пытаемся отменить все оставшиеся ордера по символу (если что-то висит).
             try:
                 self.ex.cancel_all_orders(pos.symbol)
-            except Exception as e:
-                log_error(f"{pos.symbol}: failed to cancel open orders on exit", e)
-
-            # 2) Берём весь свободный остаток базовой валюты и продаём его по рынку.
-            try:
+                
                 qty_free = self.ex.base_free(pos.symbol)
-                qty_free = self.ex.round_qty(pos.symbol, qty_free)
                 if qty_free > 0:
-                    # Binance требует minNotional даже для принудительной продажи, поэтому
-                    # пропускаем попытку, если остаток слишком мал, чтобы избежать -1013.
-                    px_for_check = est_exit_px if est_exit_px is not None else self.ex.last_price(pos.symbol)
-                    min_cost = self.ex.min_order_cost_quote(pos.symbol, fallback_price=px_for_check)
-                    est_cost = qty_free * (px_for_check or 0.0)
-                    if (min_cost is not None) and est_cost > 0 and est_cost < float(min_cost):
-                        log(
-                            f"{pos.symbol}: free qty≈{qty_free:.8f} est_cost≈{est_cost:.2f} < min_notional≈{float(min_cost):.2f} — skip force-sell",
-                            True
-                        )
-                    else:
-                        order = self.ex.create_market_sell(pos.symbol, qty_free)
-                        info = order if isinstance(order, dict) else {}
-                        filled_qty = _safe_float(info.get('filled'), info.get('amount'), info.get('info', {}).get('executedQty')) or qty_free
-                        fill_price = _safe_float(
-                            info.get('average'),
-                            info.get('price'),
-                            info.get('cost', 0) / filled_qty if filled_qty else None,
-                            info.get('info', {}).get('avgPrice'),
-                            info.get('info', {}).get('price')
-                        )
-                    if fill_price is None:
-                        fill_price = est_exit_px
-                    actual_pnl_quote = (fill_price - pos.entry) * filled_qty
-                    # Форс-продажа фиксирует остаток после логического EXIT; считаем это тех. очисткой, а не отдельной сделкой.
-                    log(
-                        f"{pos.symbol}: force-sold residual qty={qty_free:.8f} fill_px={fmt_float(fill_price,8)} pnl_quote={actual_pnl_quote:.4f} {quote_ccy}",
-                        True
-                    )
-                else:
-                    log(f"{pos.symbol}: no free base balance to force-sell on exit", True)
+                    self.ex.create_market_sell(pos.symbol, qty_free)
+                    log(f"{pos.symbol}: принудительно продан остаток={qty_free:.8f}", True)
             except Exception as e:
-                log_error(f"{pos.symbol}: failed to force-sell on exit", e)
+                log_error(f"{pos.symbol}: не удалось продать остаток при выходе", e)
 
-        # 3) В любом случае удаляем позицию из внутреннего трекера.
         self.positions.pop(pos.symbol, None)
 
-    # Основной цикл стратегии (один тик).
-    # 1) Проверяет дневные лимиты по просадке
-    # 2) Для каждого символа загружает данные, считает индикаторы и сигнал
-    # 3) Синхронизирует и обновляет защитные ордера
-    # 4) Обновляет уже открытые позиции (стоп/тейк, трейлинг)
-    # 5) При наличии сигнала и отсутствии ограничений пытается открыть новую позицию.
     def on_tick(self):
-        # Один цикл работы: проверка дневных лимитов, загрузка данных, сигналы,
-        # управление открытыми позициями и новые входы.
         self._reset_daily_limits_if_new_day()
         if not self._check_daily_dd_limit('EUR'):
-            log("Daily drawdown limit reached — pausing new entries.")
+            log("Достигнут дневной лимит просадки — новые входы приостановлены.")
             return
 
-        # Проходимся по всем указанным в .env торговым парам.
+        try:
+            all_balances = self.ex.ccxt.fetch_balance()
+            all_open_orders = self.ex.fetch_open_orders()
+        except Exception as e:
+            log_error("Не удалось загрузить балансы/ордера в начале цикла", e)
+            return
+
         for symbol in self.cfg.MARKETS:
             try:
                 tf_df = self.ex.fetch_ohlcv(symbol, self.cfg.TIMEFRAME, self.cfg.LOOKBACK)
-            except Exception as e:
-                log(f"{symbol}: fetch {self.cfg.TIMEFRAME} failed: {e}", self.cfg.VERBOSE)
-                continue
+                htf_df = self.ex.fetch_ohlcv(symbol, self.cfg.FAST_HTF, max(60, int(self.cfg.LOOKBACK/5))) if self.cfg.FAST_MODE else None
+                
+                will_long, ctx = self._signal(symbol, tf_df, htf_df)
+                last_close = ctx['last_close']
+                atr_val = ctx['atr']
 
-            htf_df = None
-            if self.cfg.FAST_MODE:
-                try:
-                    htf_df = self.ex.fetch_ohlcv(symbol, self.cfg.FAST_HTF, max(60, int(self.cfg.LOOKBACK/5)))
-                except Exception as e:
-                    log(f"{symbol}: fetch {self.cfg.FAST_HTF} failed: {e}", self.cfg.VERBOSE)
+                symbol_open_orders = [o for o in all_open_orders if o.get('symbol') == symbol]
 
-            # Entry check
-            will_long, ctx = self._signal(symbol, tf_df, htf_df)
-            last_close = ctx['last_close']
-            atr_val = ctx['atr']
-
-            # Синхронизация биржевых SL/TP отключена: работаем только с логическими
-            # уровнями внутри стратегии, без постановки защитных ордеров на биржу.
-            pass
-
-            # Менеджмент открытой позиции: применяем правила выхода
-            # (SL -25%, TP по логической цели pos.tp, фиксация плюса в конце дня).
-            if symbol in self.positions:
-                pos = self.positions[symbol]
-
-                # Если TP/ручной выход уже исполнился на бирже (позиции нет и нет ордеров) — удаляем её из трекера.
-                if self._sync_position_after_tp(symbol, last_close):
-                    continue
-
-                # Берём актуальную рыночную цену для оценки PnL; при ошибке падаем обратно к last_close.
-                try:
+                if symbol in self.positions:
+                    if self._sync_position_after_tp(symbol, last_close, all_balances, symbol_open_orders):
+                        continue
+                    
                     live_px = self.ex.last_price(symbol)
-                except Exception:
-                    live_px = last_close
-
-                if self._apply_exit_rules_by_pct(pos, live_px):
-                    # Позиция уже закрыта одним из правил, новые входы по символу
-                    # в этом тике не рассматриваем.
+                    if self._apply_exit_rules_by_pct(self.positions[symbol], live_px):
+                        continue
                     continue
 
-                # Пока позиция открыта, новые входы по этому символу не допускаются.
+                if self.losses_in_row >= self.cfg.MAX_LOSSES_IN_ROW:
+                    log(f"{symbol}: пропуск (серия убыточных {self.losses_in_row} >= {self.cfg.MAX_LOSSES_IN_ROW})", self.cfg.VERBOSE)
+                    continue
+
+                if will_long:
+                    if self._has_position_or_pending(symbol, all_balances, symbol_open_orders):
+                        continue
+                    
+                    qty = self._position_size(symbol, last_close, all_balances)
+                    if qty <= 0:
+                        log(f"{symbol}: объём слишком мал", self.cfg.VERBOSE)
+                        continue
+                    
+                    pos = self._place_orders(symbol, qty, last_close, atr_val)
+                    if pos:
+                        self.positions[symbol] = pos
+                        log_trade(f"ВХОД {symbol} направление=лонг объём={pos.qty:.8f} вход={fmt_float(pos.entry, 8)} стоп={fmt_float(pos.stop, 8)} тейк={fmt_float(pos.tp, 8) if pos.tp else 'нет'}")
+                    else:
+                        log(f"{symbol}: не удалось выставить ордер", True)
+                elif self.cfg.VERBOSE:
+                    log(f"{symbol}: входа нет — ctx=" + format_ctx_str(ctx, 8))
+
+            except Exception as e:
+                log_error(f'Не удалось обработать {symbol} в on_tick', e)
                 continue
-
-            # Риск-контроль по серии убыточных сделок.
-            if self.losses_in_row >= self.cfg.MAX_LOSSES_IN_ROW:
-                log(f"{symbol}: skip (loss streak {self.losses_in_row} >= {self.cfg.MAX_LOSSES_IN_ROW})", self.cfg.VERBOSE)
-                continue
-
-            if will_long:
-                # Доп. защита: если уже есть позиция или открытые ордера — пропускаем новый вход
-                if self._has_position_or_pending(symbol):
-                    if self.cfg.VERBOSE:
-                        log(f"{symbol}: skip — already have position or pending orders")
-                    continue
-                qty = self._position_size(symbol, last_close, atr_val, 'EUR')
-                if qty <= 0:
-                    log(f"{symbol}: qty too small", self.cfg.VERBOSE)
-                    continue
-                pos = self._place_orders(symbol, qty, last_close, atr_val)
-                if pos:
-                    self.positions[symbol] = pos
-                    entry_str = fmt_float(pos.entry, 8)
-                    stop_str = fmt_float(pos.stop, 8)
-                    tp_str = fmt_float(pos.tp, 8) if pos.tp is not None else "None"
-                    log_trade(f"ENTER {symbol} side=long qty={pos.qty:.8f} entry={entry_str} stop={stop_str} tp={tp_str}")
-                else:
-                    log(f"{symbol}: order placement failed", True)
-            else:
-                if self.cfg.VERBOSE:
-                    log(f"{symbol}: no entry — ctx=" + format_ctx_str(ctx, 8))
 
 # =========================
 # Главный цикл
@@ -1842,7 +1454,7 @@ class BreakoutWithATRAndRSI:
 # 2) Настраивает логирование
 # 3) Создаёт обёртку биржи и стратегию
 # 4) Выполняет префлайт-проверку баланса и фильтрацию рынков
-# 5) Выполняет bootstrap уже имеющихся позиций
+# 5) Инициализирует уже имеющиеся позиции
 # 6) Запускает бесконечный цикл, в котором периодически вызывается on_tick().
 def main():
     # Читаем конфиг из .env и подготавливаем все параметры стратегии.
@@ -1850,10 +1462,10 @@ def main():
     cfg = load_config()
     # Инициализация структурированных логов: app.log, trades.log, errors.log
     setup_logging('logs')
-    log(f"Starting bot — mode={cfg.MODE} markets={cfg.MARKETS} timeframe={cfg.TIMEFRAME}", True)
+    log(f"Запуск бота — режим={cfg.MODE} рынки={cfg.MARKETS} таймфрейм={cfg.TIMEFRAME}", True)
 
     if cfg.MODE == 'live' and not cfg.API_KEY:
-        log('LIVE mode requires API_KEY/API_SECRET set in .env — aborting.', True)
+        log('В режиме LIVE нужны API_KEY/API_SECRET в .env — остановка.', True)
         return
 
     # Создаём обёртку над ccxt и загружаем информацию о рынках.
@@ -1891,7 +1503,7 @@ def main():
     try:
         strat.bootstrap_existing_positions()
     except Exception as e:
-        log_error("Bootstrap existing positions failed", e)
+        log_error("Не удалось инициализировать существующие позиции", e)
 
     # Главный бесконечный цикл: на каждом шаге вызывается on_tick(),
     # после чего делается пауза SLEEP_SEC секунд.
@@ -1900,7 +1512,7 @@ def main():
         try:
             strat.on_tick()
         except Exception as e:
-            log_error('Error in on_tick', e)
+            log_error('Ошибка внутри on_tick', e)
         time.sleep(max(1, cfg.SLEEP_SEC))
 
 if __name__ == '__main__':
