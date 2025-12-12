@@ -184,6 +184,15 @@ class Config:
     HARD_STOP_LOSS_PCT: float = 0.25
     ENABLE_EOD_EXIT: bool = True
     EOD_EXIT_HOUR: int = 23
+    # Фильтры против шума и переторговки
+    STRUCTURE_LOOKBACK: int = 6          # сколько свечей назад искать локальный минимум для стопа
+    STRUCTURE_BUFFER_ATR_K: float = 0.5  # буфер под локальным минимумом в долях ATR
+    MIN_STOP_ATR_K: float = 2.0          # минимальная дистанция стопа в ATR
+    MIN_VOL_MULT: float = 1.0           # минимальный множитель объёма к SMA объёма (1.0 = без фильтра)
+    MIN_BODY_PCT: float = 0.0           # минимальный размер тела свечи в % цены (0.0 = без фильтра)
+    COOLDOWN_BARS: int = 0              # пауза после выхода по символу (в барах 1m)
+    MAX_TRADES_PER_DAY: int = 0         # лимит сделок в день (0 = без лимита)
+    MIN_RR: float = 2.0                 # минимальный риск/прибыль, если USE_TP=true
 
 # Структура для хранения информации об одной позиции.
 # В данном примере бот торгует только в лонг, поэтому side='long'.
@@ -252,6 +261,14 @@ def load_config() -> Config:
         HARD_STOP_LOSS_PCT=float(os.getenv('HARD_STOP_LOSS_PCT', '0.25')),
         ENABLE_EOD_EXIT=parse_bool(os.getenv('ENABLE_EOD_EXIT', 'true'), True),
         EOD_EXIT_HOUR=int(os.getenv('EOD_EXIT_HOUR', '23')),
+        STRUCTURE_LOOKBACK=int(os.getenv('STRUCTURE_LOOKBACK', '6')),
+        STRUCTURE_BUFFER_ATR_K=float(os.getenv('STRUCTURE_BUFFER_ATR_K', '0.5')),
+        MIN_STOP_ATR_K=float(os.getenv('MIN_STOP_ATR_K', '2.0')),
+        MIN_VOL_MULT=float(os.getenv('MIN_VOL_MULT', '1.0')),
+        MIN_BODY_PCT=float(os.getenv('MIN_BODY_PCT', '0.0')),
+        COOLDOWN_BARS=int(os.getenv('COOLDOWN_BARS', '0')),
+        MAX_TRADES_PER_DAY=int(os.getenv('MAX_TRADES_PER_DAY', '0')),
+        MIN_RR=float(os.getenv('MIN_RR', '2.0')),
     )
     return cfg
 
@@ -1147,6 +1164,8 @@ class BreakoutWithATRAndRSI:
         self.daily_start_equity_eur: Optional[float] = None
         self.losses_in_row: int = 0
         self.current_date: date = date.today()
+        self.trades_today: int = 0
+        self.last_exit_bar_index: Dict[str, int] = {}  # индекс бара, на котором был выход
 
     def _get_base_free_from_balances(self, symbol: str, balances: dict) -> float:
         """Извлекает свободный баланс базовой валюты из уже загруженного словаря балансов."""
@@ -1269,14 +1288,6 @@ class BreakoutWithATRAndRSI:
                 log(f"{symbol}: инициализация — обнаружено {base_qty} {symbol.split('/')[0]}, создана позиция вход={fmt_float(entry, 8)} стоп={fmt_float(stop, 8)}")
             except Exception as e:
                 log_error(f"{symbol}: не удалось инициализировать символ", e)
-    
-    def __init__(self, cfg: Config, ex: Exchange):
-        self.cfg = cfg
-        self.ex = ex
-        self.positions: Dict[str, Position] = {}
-        self.daily_start_equity_eur: Optional[float] = None
-        self.losses_in_row: int = 0
-        self.current_date: date = date.today()
 
     def _reset_daily_limits_if_new_day(self):
         today = date.today()
@@ -1284,6 +1295,7 @@ class BreakoutWithATRAndRSI:
             self.current_date = today
             self.daily_start_equity_eur = None
             self.losses_in_row = 0
+            self.trades_today = 0
             log("Новый день — сбрасываем дневные лимиты.")
 
     def _ensure_daily_equity_baseline(self, quote='EUR'):
@@ -1314,6 +1326,10 @@ class BreakoutWithATRAndRSI:
         prev, last = df.iloc[-2], df.iloc[-1]
         cond_breakout = (last['close'] > last['sma20']) and (last['close'] > prev['high'])
         atr_ok = self.cfg.ATR_PCT_MIN <= last['atr_pct'] <= self.cfg.ATR_PCT_MAX
+
+        # Импульс/тело свечи: фильтр по размеру тела относительно цены
+        body_pct = abs(float(last['close']) - float(last['open'])) / max(1e-12, float(last['close']))
+        body_ok = body_pct >= (self.cfg.MIN_BODY_PCT / 100.0)
         
         rsi_ok, vol_ok = True, True
         if self.cfg.FAST_MODE and htf_df is not None:
@@ -1321,9 +1337,25 @@ class BreakoutWithATRAndRSI:
             hdf['rsi'] = rsi(hdf['close'], 14)
             rsi_ok = hdf['rsi'].iloc[-1] >= self.cfg.FAST_RSI_MIN
             vol_ok = last['volume'] >= (df['vol_sma'].iloc[-1] if not np.isnan(df['vol_sma'].iloc[-1]) else 0)
+        else:
+            # Даже без FAST_MODE можно потребовать объём выше средней (если MIN_VOL_MULT > 1)
+            vsma = float(df['vol_sma'].iloc[-1] if not np.isnan(df['vol_sma'].iloc[-1]) else 0.0)
+            if vsma > 0 and self.cfg.MIN_VOL_MULT > 1.0:
+                vol_ok = float(last['volume']) >= vsma * float(self.cfg.MIN_VOL_MULT)
 
-        will_long = bool(cond_breakout and atr_ok and rsi_ok and vol_ok)
-        ctx = {'last_close': float(last['close']), 'prev_high': float(prev['high']), 'atr': float(last['atr']), 'atr_pct': float(last['atr_pct']), 'rsi_ok': rsi_ok, 'vol_ok': vol_ok, 'cond_breakout': cond_breakout, 'atr_ok': atr_ok}
+        will_long = bool(cond_breakout and atr_ok and rsi_ok and vol_ok and body_ok)
+        ctx = {
+            'last_close': float(last['close']),
+            'prev_high': float(prev['high']),
+            'atr': float(last['atr']),
+            'atr_pct': float(last['atr_pct']),
+            'rsi_ok': rsi_ok,
+            'vol_ok': vol_ok,
+            'body_ok': body_ok,
+            'body_pct': float(body_pct),
+            'cond_breakout': cond_breakout,
+            'atr_ok': atr_ok
+        }
         return will_long, ctx
 
     def _position_size(self, symbol: str, entry: float, balances: dict) -> float:
@@ -1347,12 +1379,48 @@ class BreakoutWithATRAndRSI:
             return 0.0
         return qty
 
-    def _place_orders(self, symbol: str, qty: float, entry: float, atr_val: float) -> Optional[Position]:
-        stop_virtual = entry - (self.cfg.FIXED_STOP_EUR if self.cfg.FIXED_STOP_EUR > 0 else self.cfg.ATR_K * atr_val)
+    def _calc_stop_from_structure(self, symbol: str, tf_df: pd.DataFrame, entry: float, atr_val: float) -> float:
+        """Считает стоп-лосс как минимум из ATR-стопа и стопа по структуре."""
+        atr_stop = entry - (self.cfg.FIXED_STOP_EUR if (self.cfg.FIXED_STOP_EUR and self.cfg.FIXED_STOP_EUR > 0) else self.cfg.ATR_K * atr_val)
+
+        # Локальный минимум за N предыдущих свечей (структура)
+        lookback = max(2, int(self.cfg.STRUCTURE_LOOKBACK))
+        try:
+            recent_slice = tf_df.iloc[-(lookback + 1):-1]
+            recent_low = float(recent_slice['low'].min())
+        except Exception:
+            recent_low = entry
+
+        struct_stop = recent_low - float(self.cfg.STRUCTURE_BUFFER_ATR_K) * atr_val
+
+        # Выбираем более широкий стоп (ниже по цене)
+        stop = min(float(atr_stop), float(struct_stop))
+
+        # Гарантируем, что стоп дальше рыночного шума: минимум MIN_STOP_ATR_K * ATR
+        min_stop = entry - float(self.cfg.MIN_STOP_ATR_K) * atr_val
+        stop = min(stop, float(min_stop))
+
+        # Учитываем floor по STOP_MAX_PCT и minPrice
+        minp = self.ex.min_price(symbol)
+        stop_floor = max(minp, entry * (1.0 - self.cfg.STOP_MAX_PCT))
+        stop = max(stop, stop_floor)
+        return float(stop)
+
+    def _place_orders(self, symbol: str, qty: float, entry: float, atr_val: float, tf_df: pd.DataFrame) -> Optional[Position]:
+        stop_virtual = self._calc_stop_from_structure(symbol, tf_df, entry, atr_val)
         minp = self.ex.min_price(symbol)
         stop_floor = max(minp, entry * (1.0 - self.cfg.STOP_MAX_PCT))
         stop_virtual = max(stop_virtual, stop_floor)
         tp = entry + self.cfg.TP_R_MULT * (entry - stop_virtual) if self.cfg.USE_TP else None
+
+        # Проверяем минимальное RR, если тейк включён
+        if self.cfg.USE_TP and tp is not None:
+            risk = max(1e-12, entry - stop_virtual)
+            reward = max(0.0, tp - entry)
+            rr = reward / risk if risk > 0 else 0.0
+            if rr < float(self.cfg.MIN_RR):
+                log(f"{symbol}: пропуск — RR {rr:.2f} ниже минимального {self.cfg.MIN_RR:.2f}", self.cfg.VERBOSE)
+                return None
 
         if self.cfg.MODE == 'paper':
             return Position(symbol, 'long', qty, entry, stop_virtual, tp)
@@ -1362,7 +1430,7 @@ class BreakoutWithATRAndRSI:
         filled_price = float(buy.get('average', buy.get('price', entry)) or entry)
         
         # Пересчитываем уровни исходя из фактической цены исполнения
-        stop_final = filled_price - (self.cfg.FIXED_STOP_EUR if self.cfg.FIXED_STOP_EUR > 0 else self.cfg.ATR_K * atr_val)
+        stop_final = self._calc_stop_from_structure(symbol, tf_df, filled_price, atr_val)
         stop_final = max(stop_final, filled_price * (1.0 - self.cfg.STOP_MAX_PCT))
         tp_final = filled_price + self.cfg.TP_R_MULT * (filled_price - stop_final) if self.cfg.USE_TP else None
 
@@ -1386,6 +1454,11 @@ class BreakoutWithATRAndRSI:
                 log_error(f"{pos.symbol}: не удалось продать остаток при выходе", e)
 
         self.positions.pop(pos.symbol, None)
+        # фиксируем выход для паузы/кулдауна
+        try:
+            self.last_exit_bar_index[pos.symbol] = int(self._bar_index)
+        except Exception:
+            self.last_exit_bar_index[pos.symbol] = 0
 
     def on_tick(self):
         self._reset_daily_limits_if_new_day()
@@ -1403,6 +1476,8 @@ class BreakoutWithATRAndRSI:
         for symbol in self.cfg.MARKETS:
             try:
                 tf_df = self.ex.fetch_ohlcv(symbol, self.cfg.TIMEFRAME, self.cfg.LOOKBACK)
+                # индекс бара для кулдауна (просто счётчик на основе длины df)
+                self._bar_index = len(tf_df)
                 htf_df = self.ex.fetch_ohlcv(symbol, self.cfg.FAST_HTF, max(60, int(self.cfg.LOOKBACK/5))) if self.cfg.FAST_MODE else None
                 
                 will_long, ctx = self._signal(symbol, tf_df, htf_df)
@@ -1420,6 +1495,19 @@ class BreakoutWithATRAndRSI:
                         continue
                     continue
 
+                # Дневной лимит сделок
+                if self.cfg.MAX_TRADES_PER_DAY and self.cfg.MAX_TRADES_PER_DAY > 0:
+                    if self.trades_today >= int(self.cfg.MAX_TRADES_PER_DAY):
+                        log(f"{symbol}: пропуск — дневной лимит сделок {self.cfg.MAX_TRADES_PER_DAY} достигнут", self.cfg.VERBOSE)
+                        continue
+
+                # Кулдаун после выхода по символу
+                if self.cfg.COOLDOWN_BARS and self.cfg.COOLDOWN_BARS > 0:
+                    last_exit_idx = self.last_exit_bar_index.get(symbol)
+                    if last_exit_idx is not None and (self._bar_index - int(last_exit_idx)) < int(self.cfg.COOLDOWN_BARS):
+                        log(f"{symbol}: пропуск — кулдаун {self.cfg.COOLDOWN_BARS} баров после выхода", self.cfg.VERBOSE)
+                        continue
+
                 if self.losses_in_row >= self.cfg.MAX_LOSSES_IN_ROW:
                     log(f"{symbol}: пропуск (серия убыточных {self.losses_in_row} >= {self.cfg.MAX_LOSSES_IN_ROW})", self.cfg.VERBOSE)
                     continue
@@ -1433,10 +1521,11 @@ class BreakoutWithATRAndRSI:
                         log(f"{symbol}: объём слишком мал", self.cfg.VERBOSE)
                         continue
                     
-                    pos = self._place_orders(symbol, qty, last_close, atr_val)
+                    pos = self._place_orders(symbol, qty, last_close, atr_val, tf_df)
                     if pos:
                         self.positions[symbol] = pos
                         log_trade(f"ВХОД {symbol} направление=лонг объём={pos.qty:.8f} вход={fmt_float(pos.entry, 8)} стоп={fmt_float(pos.stop, 8)} тейк={fmt_float(pos.tp, 8) if pos.tp else 'нет'}")
+                        self.trades_today += 1
                     else:
                         log(f"{symbol}: не удалось выставить ордер", True)
                 elif self.cfg.VERBOSE:
