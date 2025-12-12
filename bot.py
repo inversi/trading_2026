@@ -100,7 +100,7 @@ import numpy as np
 from dotenv import load_dotenv
 
 import logging
-from logging.handlers import TimedRotatingFileHandler
+from logging.handlers import RotatingFileHandler
 import pathlib
 
 # =========================
@@ -193,6 +193,15 @@ class Config:
     COOLDOWN_BARS: int = 0              # пауза после выхода по символу (в барах 1m)
     MAX_TRADES_PER_DAY: int = 0         # лимит сделок в день (0 = без лимита)
     MIN_RR: float = 2.0                 # минимальный риск/прибыль, если USE_TP=true
+    # Трейлинг фиксации прибыли (аналог trailing stop, но в терминах % прибыли от входа).
+    # Пример: при прибыли +2% ставим стоп на +1% (TRAIL_PROFIT_TRIGGER_PCT=0.02, TRAIL_PROFIT_OFFSET_PCT=0.01),
+    # далее стоп двигается вверх, фиксируя потенциальную прибыль.
+    ENABLE_TRAIL_PROFIT: bool = False
+    TRAIL_PROFIT_TRIGGER_PCT: float = 0.02
+    TRAIL_PROFIT_OFFSET_PCT: float = 0.01
+    TRAIL_PROFIT_MIN_LOCK_PCT: float = 0.001
+    TRAIL_PROFIT_MIN_MOVE_PCT: float = 0.002
+    TRAIL_PROFIT_STOP_LIMIT_GAP_PCT: float = 0.001
 
 # Структура для хранения информации об одной позиции.
 # В данном примере бот торгует только в лонг, поэтому side='long'.
@@ -206,6 +215,7 @@ class Position:
     entry: float
     stop: float
     tp: Optional[float]
+    trail_stop: Optional[float] = None
 
 # =========================
 # Вспомогательные утилиты
@@ -269,6 +279,12 @@ def load_config() -> Config:
         COOLDOWN_BARS=int(os.getenv('COOLDOWN_BARS', '0')),
         MAX_TRADES_PER_DAY=int(os.getenv('MAX_TRADES_PER_DAY', '0')),
         MIN_RR=float(os.getenv('MIN_RR', '2.0')),
+        ENABLE_TRAIL_PROFIT=parse_bool(os.getenv('ENABLE_TRAIL_PROFIT', 'false'), False),
+        TRAIL_PROFIT_TRIGGER_PCT=float(os.getenv('TRAIL_PROFIT_TRIGGER_PCT', '0.02')),
+        TRAIL_PROFIT_OFFSET_PCT=float(os.getenv('TRAIL_PROFIT_OFFSET_PCT', '0.01')),
+        TRAIL_PROFIT_MIN_LOCK_PCT=float(os.getenv('TRAIL_PROFIT_MIN_LOCK_PCT', '0.001')),
+        TRAIL_PROFIT_MIN_MOVE_PCT=float(os.getenv('TRAIL_PROFIT_MIN_MOVE_PCT', '0.002')),
+        TRAIL_PROFIT_STOP_LIMIT_GAP_PCT=float(os.getenv('TRAIL_PROFIT_STOP_LIMIT_GAP_PCT', '0.001')),
     )
     return cfg
 
@@ -378,20 +394,23 @@ def setup_logging(base_dir: str = 'logs'):
     log_dir = pathlib.Path(base_dir)
     log_dir.mkdir(parents=True, exist_ok=True)
 
+    # Ограничение размера одного файла лога (например, для отправки/загрузки сервисами с лимитом 10MB).
+    # Дефолт: 9MB, чтобы гарантированно не превысить 10_485_760 байт.
+    max_bytes = int(os.getenv("LOG_MAX_BYTES", 9 * 1024 * 1024))
+    backup_count = int(os.getenv("LOG_BACKUP_COUNT", 30))
+
     # Общий форматтер с временем в UTC
     formatter = logging.Formatter('[%(asctime)s UTC] %(message)s')
     formatter.converter = time.gmtime  # принудительно используем UTC при форматировании времени
 
-    def make_handler(filename: str, level: int) -> TimedRotatingFileHandler:
-        # Пишем в файл log_dir/filename, ротация по дням: каждые сутки создаётся новый файл
-        # Формат имён по умолчанию: app.log.YYYY-MM-DD, trades.log.YYYY-MM-DD и т.п.
-        h = TimedRotatingFileHandler(
+    def make_handler(filename: str, level: int) -> RotatingFileHandler:
+        # Пишем в файл log_dir/filename, ротация по размеру: файлы не разрастаются больше max_bytes.
+        # Резервные файлы будут называться app.log.1, app.log.2, ...
+        h = RotatingFileHandler(
             log_dir / filename,
-            when="midnight",      # ротация в полночь по UTC (мы используем UTC в formatter)
-            interval=1,
-            backupCount=30,         # сколько дней логов хранить
+            maxBytes=max_bytes,
+            backupCount=backup_count,
             encoding="utf-8",
-            utc=True                # чтобы ротация была привязана к UTC
         )
         h.setLevel(level)
         h.setFormatter(formatter)
@@ -1167,6 +1186,108 @@ class BreakoutWithATRAndRSI:
         self.trades_today: int = 0
         self.last_exit_bar_index: Dict[str, int] = {}  # индекс бара, на котором был выход
 
+    def _calc_trail_profit_stop(self, pos: Position, last_price: float) -> Optional[float]:
+        if not self.cfg.ENABLE_TRAIL_PROFIT:
+            return None
+        if pos is None or pos.qty <= 0 or pos.entry <= 0 or last_price <= 0:
+            return None
+        if pos.side != 'long':
+            return None
+
+        pnl_pct = (last_price - pos.entry) / pos.entry
+        if pnl_pct < float(self.cfg.TRAIL_PROFIT_TRIGGER_PCT):
+            return None
+
+        offset = float(self.cfg.TRAIL_PROFIT_OFFSET_PCT)
+        locked_profit_pct = pnl_pct - offset
+        min_lock = float(self.cfg.TRAIL_PROFIT_MIN_LOCK_PCT)
+        locked_profit_pct = max(locked_profit_pct, min_lock)
+        stop_price = pos.entry * (1.0 + locked_profit_pct)
+
+        # Стоп всегда должен быть ниже текущей цены, иначе ордер закроется сразу.
+        stop_price = min(stop_price, last_price * (1.0 - 1e-4))
+        return float(stop_price)
+
+    def _extract_order_stop_price(self, order: dict) -> Optional[float]:
+        if not order:
+            return None
+        for k in ("stopPrice", "stop_price", "triggerPrice", "trigger_price"):
+            v = order.get(k)
+            if v is not None:
+                try:
+                    return float(v)
+                except Exception:
+                    pass
+        info = order.get("info") or {}
+        for k in ("stopPrice", "stop_price", "triggerPrice", "trigger_price"):
+            v = info.get(k)
+            if v is not None:
+                try:
+                    return float(v)
+                except Exception:
+                    pass
+        return None
+
+    def _find_open_stop_loss_sells(self, open_orders: List[dict]) -> List[dict]:
+        out = []
+        for o in open_orders or []:
+            try:
+                side = (o.get("side") or "").lower()
+                otype = (o.get("type") or "").lower()
+                if side == "sell" and ("stop" in otype):
+                    out.append(o)
+            except Exception:
+                continue
+        return out
+
+    def _upsert_live_trail_stop_order(self, pos: Position, balances: dict, open_orders: List[dict], stop_price: float) -> None:
+        if self.cfg.MODE != "live":
+            return
+        qty_free = self._get_base_free_from_balances(pos.symbol, balances)
+        qty = self.ex.round_qty(pos.symbol, qty_free)
+        if qty <= 0:
+            return
+
+        existing_stops = self._find_open_stop_loss_sells(open_orders)
+        existing = existing_stops[0] if existing_stops else None
+        existing_stop = self._extract_order_stop_price(existing) if existing else None
+
+        min_move_abs = max(0.0, float(pos.entry) * float(self.cfg.TRAIL_PROFIT_MIN_MOVE_PCT))
+        if (existing_stop is not None) and (stop_price <= float(existing_stop) + min_move_abs):
+            return
+
+        if existing:
+            oid = existing.get("id") or existing.get("orderId") or (existing.get("info") or {}).get("orderId")
+            if oid:
+                self.ex.cancel_order(str(oid), pos.symbol)
+
+        gap_pct = max(0.0, float(self.cfg.TRAIL_PROFIT_STOP_LIMIT_GAP_PCT))
+        limit_price = float(stop_price) * (1.0 - gap_pct)
+        minp = self.ex.min_price(pos.symbol)
+        limit_price = max(float(minp), float(limit_price))
+        stop_price = max(float(minp), float(stop_price))
+        if limit_price >= stop_price:
+            limit_price = max(float(minp), stop_price * (1.0 - 1e-4))
+
+        try:
+            self.ex.create_stop_loss_limit(pos.symbol, qty, stop_price=stop_price, limit_price=limit_price)
+        except Exception as e:
+            log_error(f"{pos.symbol}: не удалось обновить трейлинг-стоп ордер", e)
+
+    def _update_trailing_profit(self, pos: Position, last_price: float, balances: dict, open_orders: List[dict]) -> None:
+        stop_price = self._calc_trail_profit_stop(pos, last_price)
+        if stop_price is None:
+            return
+
+        min_move_abs = max(0.0, float(pos.entry) * float(self.cfg.TRAIL_PROFIT_MIN_MOVE_PCT))
+        if (pos.trail_stop is not None) and (stop_price <= float(pos.trail_stop) + min_move_abs):
+            return
+
+        pos.trail_stop = float(stop_price)
+        pnl_pct = (last_price - pos.entry) / pos.entry
+        log(f"{pos.symbol}: трейлинг-профит обновлён стоп={fmt_float(pos.trail_stop, 8)} pnl={pnl_pct*100:.2f}%", self.cfg.VERBOSE)
+        self._upsert_live_trail_stop_order(pos, balances, open_orders, stop_price=float(pos.trail_stop))
+
     def _get_base_free_from_balances(self, symbol: str, balances: dict) -> float:
         """Извлекает свободный баланс базовой валюты из уже загруженного словаря балансов."""
         base = symbol.split('/')[0]
@@ -1244,6 +1365,15 @@ class BreakoutWithATRAndRSI:
             reason = f"жесткий_стоп_{self.cfg.HARD_STOP_LOSS_PCT*100:.0f}% результат={pnl_pct:.4f}"
             self._cancel_position(pos, reason=reason, exit_price=last_price)
             self.losses_in_row += 1
+            return True
+
+        if pos.trail_stop is not None and last_price <= float(pos.trail_stop):
+            self._cancel_position(
+                pos,
+                reason=f"трейлинг_профит_стоп стоп={float(pos.trail_stop):.8f} результат={pnl_pct:.4f}",
+                exit_price=last_price,
+            )
+            self.losses_in_row = 0
             return True
 
         if self.cfg.USE_TP and pos.tp is not None and last_price >= pos.tp:
@@ -1489,8 +1619,9 @@ class BreakoutWithATRAndRSI:
                 if symbol in self.positions:
                     if self._sync_position_after_tp(symbol, last_close, all_balances, symbol_open_orders):
                         continue
-                    
+
                     live_px = self.ex.last_price(symbol)
+                    self._update_trailing_profit(self.positions[symbol], live_px, all_balances, symbol_open_orders)
                     if self._apply_exit_rules_by_pct(self.positions[symbol], live_px):
                         continue
                     continue
