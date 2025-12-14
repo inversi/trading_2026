@@ -95,6 +95,7 @@ from dataclasses import dataclass
 from typing import List, Dict, Optional, Tuple
 
 import ccxt
+from ccxt.base.errors import DDoSProtection, ExchangeNotAvailable, NetworkError, RequestTimeout
 import pandas as pd
 import numpy as np
 from dotenv import load_dotenv
@@ -193,6 +194,10 @@ class Config:
     COOLDOWN_BARS: int = 0              # пауза после выхода по символу (в барах 1m)
     MAX_TRADES_PER_DAY: int = 0         # лимит сделок в день (0 = без лимита)
     MIN_RR: float = 2.0                 # минимальный риск/прибыль, если USE_TP=true
+    # Сеть/ccxt
+    CCXT_TIMEOUT_MS: int = 30000
+    CCXT_RETRY_COUNT: int = 3
+    CCXT_RETRY_BACKOFF_SEC: float = 1.0
     # Трейлинг фиксации прибыли (аналог trailing stop, но в терминах % прибыли от входа).
     # Пример: при прибыли +2% ставим стоп на +1% (TRAIL_PROFIT_TRIGGER_PCT=0.02, TRAIL_PROFIT_OFFSET_PCT=0.01),
     # далее стоп двигается вверх, фиксируя потенциальную прибыль.
@@ -279,6 +284,9 @@ def load_config() -> Config:
         COOLDOWN_BARS=int(os.getenv('COOLDOWN_BARS', '0')),
         MAX_TRADES_PER_DAY=int(os.getenv('MAX_TRADES_PER_DAY', '0')),
         MIN_RR=float(os.getenv('MIN_RR', '2.0')),
+        CCXT_TIMEOUT_MS=int(os.getenv('CCXT_TIMEOUT_MS', '30000')),
+        CCXT_RETRY_COUNT=int(os.getenv('CCXT_RETRY_COUNT', '3')),
+        CCXT_RETRY_BACKOFF_SEC=float(os.getenv('CCXT_RETRY_BACKOFF_SEC', '1.0')),
         ENABLE_TRAIL_PROFIT=parse_bool(os.getenv('ENABLE_TRAIL_PROFIT', 'false'), False),
         TRAIL_PROFIT_TRIGGER_PCT=float(os.getenv('TRAIL_PROFIT_TRIGGER_PCT', '0.02')),
         TRAIL_PROFIT_OFFSET_PCT=float(os.getenv('TRAIL_PROFIT_OFFSET_PCT', '0.01')),
@@ -488,20 +496,53 @@ class Exchange:
             'apiKey': cfg.API_KEY or '',
             'secret': cfg.API_SECRET or '',
             'enableRateLimit': True,
+            'timeout': int(getattr(cfg, 'CCXT_TIMEOUT_MS', 30000)),
             'options': {'defaultType': 'spot'}
         })
         # Загружаем унифицированные обозначения символов вида 'PEPE/EUR'
-        self.markets = self.ccxt.load_markets()
+        self.markets = self._call_with_retries("load_markets", self.ccxt.load_markets)
         self.has_oco = bool(getattr(self.ccxt, 'has', {}).get('createOrderOCO', False))
+
+    def _call_with_retries(self, name: str, fn, *args, **kwargs):
+        retry_count = max(1, int(getattr(self.cfg, "CCXT_RETRY_COUNT", 3) or 1))
+        base_backoff = float(getattr(self.cfg, "CCXT_RETRY_BACKOFF_SEC", 1.0) or 0.0)
+        transient = (RequestTimeout, NetworkError, ExchangeNotAvailable, DDoSProtection)
+        last_exc = None
+        for attempt in range(1, retry_count + 1):
+            try:
+                return fn(*args, **kwargs)
+            except transient as e:
+                last_exc = e
+                if attempt >= retry_count:
+                    raise
+                sleep_s = max(0.0, base_backoff * attempt)
+                if sleep_s > 0:
+                    time.sleep(sleep_s)
+            except Exception as e:
+                last_exc = e
+                raise
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError(f"{name}: неизвестная ошибка")
 
     # Загружает OHLCV-данные и превращает их в DataFrame с удобными именами
     # колонок. Именно с этим форматом далее работает стратегия.
     def fetch_ohlcv(self, symbol: str, timeframe: str, limit: int) -> pd.DataFrame:
         # Загружаем OHLCV и приводим к DataFrame с колонками ts/open/high/low/close/volume.
-        ohlcv = self.ccxt.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+        ohlcv = self._call_with_retries(
+            f"fetch_ohlcv({symbol},{timeframe},{limit})",
+            self.ccxt.fetch_ohlcv,
+            symbol,
+            timeframe=timeframe,
+            limit=limit,
+        )
         df = pd.DataFrame(ohlcv, columns=['ts','open','high','low','close','volume'])
         df['ts'] = pd.to_datetime(df['ts'], unit='ms')
         return df
+
+    def fetch_balance(self) -> dict:
+        """fetch_balance с ретраями (может бросать исключение при окончательном провале)."""
+        return self._call_with_retries("fetch_balance", self.ccxt.fetch_balance)
 
     # Оценка общего спот-баланса в выбранной котируемой валюте (по умолчанию EUR).
     # Перебираются все активы кошелька и для каждого ищется путь конверсии
@@ -687,7 +728,10 @@ class Exchange:
     def base_free(self, symbol: str) -> float:
         """Свободный остаток базовой валюты по символу (например, PEPE для PEPE/EUR)."""
         base = symbol.split('/')[0]
-        bal = self.ccxt.fetch_balance()
+        try:
+            bal = self.fetch_balance()
+        except Exception:
+            return 0.0
         try:
             return float(bal.get('free', {}).get(base, 0.0) or 0.0)
         except Exception:
@@ -726,7 +770,7 @@ class Exchange:
     def fetch_open_orders(self, symbol: Optional[str] = None) -> List[dict]:
         """Возвращает список открытых ордеров (spot). Если symbol=None — по всем рынкам."""
         try:
-            return self.ccxt.fetch_open_orders(symbol)
+            return self._call_with_retries("fetch_open_orders", self.ccxt.fetch_open_orders, symbol)
         except Exception:
             return []
 
@@ -735,7 +779,7 @@ class Exchange:
 
     def last_price(self, symbol: str) -> float:
         """Последняя цена по тикеру (last)."""
-        t = self.ccxt.fetch_ticker(symbol)
+        t = self._call_with_retries("fetch_ticker", self.ccxt.fetch_ticker, symbol)
         return float(t.get('last') or t.get('close') or t.get('bid') or 0.0)
 
     # Возвращает оценку минимальной стоимости ордера (minNotional) в котируемой валюте.
@@ -1597,7 +1641,7 @@ class BreakoutWithATRAndRSI:
             return
 
         try:
-            all_balances = self.ex.ccxt.fetch_balance()
+            all_balances = self.ex.fetch_balance()
             all_open_orders = self.ex.fetch_open_orders()
         except Exception as e:
             log_error("Не удалось загрузить балансы/ордера в начале цикла", e)
@@ -1662,6 +1706,10 @@ class BreakoutWithATRAndRSI:
                 elif self.cfg.VERBOSE:
                     log(f"{symbol}: входа нет — ctx=" + format_ctx_str(ctx, 8))
 
+            except (RequestTimeout, NetworkError, ExchangeNotAvailable, DDoSProtection) as e:
+                # Сетевые/временные ошибки — обычно временные, не нужно засорять лог длинным traceback.
+                log_error(f"Сеть/таймаут при обработке {symbol} в on_tick | исключение={e}")
+                continue
             except Exception as e:
                 log_error(f'Не удалось обработать {symbol} в on_tick', e)
                 continue
