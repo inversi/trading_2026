@@ -182,7 +182,7 @@ class Config:
     STOP_MAX_PCT: float = 0.3
     # Новые настраиваемые параметры
     TARGET_ENTRY_COST: float = 10.0
-    HARD_STOP_LOSS_PCT: float = 0.25
+    HARD_STOP_LOSS_PCT: float = 0.15
     ENABLE_EOD_EXIT: bool = True
     EOD_EXIT_HOUR: int = 23
     # Фильтры против шума и переторговки
