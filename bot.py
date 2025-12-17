@@ -1348,6 +1348,16 @@ class BreakoutWithATRAndRSI:
         except Exception:
             return 0.0
 
+    def _get_total_base_from_balances(self, symbol: str, balances: dict) -> float:
+        """Возвращает сумму свободного и зарезервированного баланса по базовой валюте."""
+        base = symbol.split('/')[0]
+        try:
+            free = float(balances.get('free', {}).get(base, 0.0) or 0.0)
+            used = float(balances.get('used', {}).get(base, 0.0) or 0.0)
+            return max(0.0, free + used)
+        except Exception:
+            return 0.0
+
     # Проверяет, есть ли уже позиция или открытые ордера по символу.
     def _has_position_or_pending(self, symbol: str, balances: dict, open_orders: List[dict]) -> bool:
         """Возвращает истину, если уже есть позиция (в трекере или по балансу) или есть открытые ордера по символу."""
@@ -1434,24 +1444,58 @@ class BreakoutWithATRAndRSI:
 
         return False
 
-    def _force_close_loss_positions(self, threshold_pct: float) -> None:
+    def _force_close_loss_positions(self, threshold_pct: float, balances: dict) -> None:
         """Принудительно закрывает позиции, просившие больше порога."""
         if threshold_pct <= 0.0:
             return
 
-        for symbol, pos in list(self.positions.items()):
-            if pos is None or pos.qty <= 0 or pos.entry <= 0:
-                continue
+        if balances is None:
             try:
-                last_price = self.ex.last_price(symbol)
+                balances = self.ex.fetch_balance()
             except Exception:
+                balances = {}
+
+        for symbol in self.cfg.MARKETS:
+            qty = self._get_total_base_from_balances(symbol, balances)
+            if qty <= 0:
                 continue
 
-            pnl_pct = (last_price - pos.entry) / pos.entry
-            if pnl_pct <= -threshold_pct:
-                reason = f"принудительный_жесткий_стоп_{threshold_pct*100:.0f}% результат={pnl_pct:.4f}"
+            pos = self.positions.get(symbol)
+            entry_price = None
+            working_qty = qty
+            if pos and pos.qty > 0 and pos.entry > 0:
+                entry_price = pos.entry
+                working_qty = pos.qty
+            else:
+                try:
+                    entry_price = self.ex.avg_buy_price(symbol)
+                except Exception:
+                    entry_price = None
+
+            if entry_price is None or entry_price <= 0:
+                if self.cfg.VERBOSE:
+                    log(f"{symbol}: не удалось оценить вход для принудительного стопа, пропускаем.", True)
+                continue
+
+            try:
+                last_price = self.ex.last_price(symbol)
+            except Exception as e:
+                log_error(f"{symbol}: не удалось получить цену для принудительного стопа", e)
+                continue
+
+            pnl_pct = (last_price - entry_price) / entry_price
+            if pnl_pct > -threshold_pct:
+                continue
+
+            reason = f"принудительный_жесткий_стоп_{threshold_pct*100:.0f}% результат={pnl_pct:.4f}"
+            if pos:
                 self._cancel_position(pos, reason=reason, exit_price=last_price)
-                self.losses_in_row += 1
+            else:
+                temp_pos = Position(symbol, 'long', working_qty, entry_price, entry_price * (1.0 - self.cfg.STOP_MAX_PCT), None)
+                self.positions[symbol] = temp_pos
+                self._cancel_position(temp_pos, reason=reason, exit_price=last_price)
+
+            self.losses_in_row += 1
 
     def bootstrap_existing_positions(self):
         """Сканирует свободные остатки базовых валют для всех символов и, если они есть, добавляет их как активные позиции."""
@@ -1666,7 +1710,7 @@ class BreakoutWithATRAndRSI:
             log_error("Не удалось загрузить балансы/ордера в начале цикла", e)
             return
 
-        self._force_close_loss_positions(self.cfg.HARD_STOP_LOSS_PCT)
+        self._force_close_loss_positions(self.cfg.HARD_STOP_LOSS_PCT, all_balances)
 
         for symbol in self.cfg.MARKETS:
             try:
