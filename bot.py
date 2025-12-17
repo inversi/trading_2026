@@ -95,7 +95,7 @@ from dataclasses import dataclass
 from typing import List, Dict, Optional, Tuple
 
 import ccxt
-from ccxt.base.errors import DDoSProtection, ExchangeNotAvailable, NetworkError, RequestTimeout
+from ccxt.base.errors import DDoSProtection, ExchangeNotAvailable, NetworkError, RequestTimeout, InvalidOrder
 import pandas as pd
 import numpy as np
 from dotenv import load_dotenv
@@ -164,6 +164,7 @@ class Config:
     MAX_DAILY_DD_PCT: float
     MAX_LOSSES_IN_ROW: int
     VERBOSE: bool
+    VERBOSE_CTX: bool
     SLEEP_SEC: int
     FAST_MODE: bool
     FAST_HTF: str
@@ -233,12 +234,8 @@ def parse_bool(v: str, default=False) -> bool:
     return str(v).strip().lower() in ('1', 'true', 'yes', 'y', 'on')
 
 #
-# Читает .env и формирует конфигурацию бота. Все поля имеют значения по умолчанию,
-# чтобы удобно тестировать в paper-режиме. В live-режиме ключи API обязательны.
-# Читает .env и формирует объект Config.
-# Здесь задаются значения по умолчанию, чтобы можно было быстро запустить
-# бота в paper-режиме без дополнительной настройки. В live-режиме
-# обязательны ключи API_KEY / API_SECRET.
+# Читает .env и формирует объект Config. Значения по умолчанию позволяют быстро
+# запустить бота в paper-режиме. В live-режиме обязательны API_KEY / API_SECRET.
 def load_config() -> Config:
     load_dotenv()
     MODE = os.getenv('MODE', 'paper').strip().lower()
@@ -256,6 +253,7 @@ def load_config() -> Config:
         MAX_DAILY_DD_PCT=float(os.getenv('MAX_DAILY_DD_PCT', '0.02')),
         MAX_LOSSES_IN_ROW=int(os.getenv('MAX_LOSSES_IN_ROW', '3')),
         VERBOSE=parse_bool(os.getenv('VERBOSE', 'true'), True),
+        VERBOSE_CTX=parse_bool(os.getenv('VERBOSE_CTX', 'false'), False),
         SLEEP_SEC=int(os.getenv('SLEEP_SEC', '3')),
         FAST_MODE=parse_bool(os.getenv('FAST_MODE', 'false'), False),
         FAST_HTF=os.getenv('FAST_HTF', '5m'),
@@ -993,9 +991,35 @@ class Exchange:
 
     # Рынок-продажа по текущей цене. Используется при принудительном закрытии
     # позиции, чтобы продать весь доступный объём базовой валюты.
-    def create_market_sell(self, symbol: str, amount: float) -> dict:
-        amount_p = float(self.ccxt.amount_to_precision(symbol, amount))
+    def create_market_sell(self, symbol: str, amount: float, price_hint: Optional[float] = None) -> dict:
+        qty = self.round_qty(symbol, amount)
+        if qty <= 0:
+            raise InvalidOrder(f"{symbol} amount {amount} ниже минимума после округления")
+
+        px = price_hint or self.last_price(symbol)
+        min_cost = self.min_order_cost_quote(symbol, fallback_price=px)
+        if min_cost is not None and px > 0 and (qty * px < float(min_cost)):
+            raise InvalidOrder(f"{symbol} notional {qty*px:.8f} ниже minNotional {float(min_cost):.8f}")
+
+        amount_p = float(self.ccxt.amount_to_precision(symbol, qty))
         return self.ccxt.create_order(symbol, 'market', 'sell', amount_p)
+
+    def safe_market_sell_all(self, symbol: str, price_hint: Optional[float] = None) -> bool:
+        """Продаёт весь доступный объём базовой валюты, если он проходит minNotional/precision."""
+        qty_free = self.base_free(symbol)
+        qty = self.round_qty(symbol, qty_free)
+        if qty <= 0:
+            log(f"{symbol}: остаток {qty_free:.8f} слишком мал для продажи, пропускаем", True)
+            return False
+
+        px = price_hint or self.last_price(symbol)
+        min_cost = self.min_order_cost_quote(symbol, fallback_price=px)
+        if min_cost is not None and px > 0 and (qty * px < float(min_cost)):
+            log(f"{symbol}: остаток {qty:.8f} * цена {px:.8f} ниже minNotional {float(min_cost):.8f}, пропускаем", True)
+            return False
+
+        self.create_market_sell(symbol, qty, price_hint=px)
+        return True
 
     # Лимитный ордер на продажу (обычно для TP). Все значения приводятся
     # к нужной точности через ccxt.*_to_precision. Для Binance дополнительно
@@ -1507,11 +1531,6 @@ class BreakoutWithATRAndRSI:
                     continue
 
                 last = self.ex.last_price(symbol)
-                min_cost = self.ex.min_order_cost_quote(symbol, fallback_price=last)
-                if min_cost is not None and (base_qty * last < float(min_cost)):
-                    log(f"{symbol}: инициализация — остаток {base_qty} считается пылью, пропускаем.")
-                    continue
-
                 tf_df = self.ex.fetch_ohlcv(symbol, self.cfg.TIMEFRAME, max(60, self.cfg.LOOKBACK))
                 df = tf_df.copy()
                 df['atr'] = atr(df, 14)
@@ -1683,13 +1702,9 @@ class BreakoutWithATRAndRSI:
             try:
                 self.ex.cancel_all_orders(pos.symbol)
 
-                qty_free = self.ex.base_free(pos.symbol)
-                sell_qty = self.ex.round_qty(pos.symbol, qty_free)
-                if sell_qty > 0:
-                    self.ex.create_market_sell(pos.symbol, sell_qty)
-                    log(f"{pos.symbol}: принудительно продан остаток={sell_qty:.8f}", True)
-                else:
-                    log(f"{pos.symbol}: остаток {qty_free:.8f} слишком мал для продажи, пропускаем", True)
+                sold = self.ex.safe_market_sell_all(pos.symbol, price_hint=est_exit_px)
+                if sold:
+                    log(f"{pos.symbol}: принудительно продан остаток", True)
             except Exception as e:
                 log_error(f"{pos.symbol}: не удалось продать остаток при выходе", e)
 
@@ -1771,7 +1786,7 @@ class BreakoutWithATRAndRSI:
                         self.trades_today += 1
                     else:
                         log(f"{symbol}: не удалось выставить ордер", True)
-                elif self.cfg.VERBOSE:
+                elif self.cfg.VERBOSE_CTX:
                     log(f"{symbol}: входа нет — ctx=" + format_ctx_str(ctx, 8))
 
             except (RequestTimeout, NetworkError, ExchangeNotAvailable, DDoSProtection) as e:
