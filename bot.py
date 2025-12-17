@@ -273,7 +273,7 @@ def load_config() -> Config:
         FIXED_STOP_EUR=float(os.getenv('FIXED_STOP_EUR', '0') or 0.0),
         STOP_MAX_PCT=float(os.getenv('STOP_MAX_PCT', '0.3')),
         TARGET_ENTRY_COST=float(os.getenv('TARGET_ENTRY_COST', '10.0')),
-        HARD_STOP_LOSS_PCT=float(os.getenv('HARD_STOP_LOSS_PCT', '0.25')),
+        HARD_STOP_LOSS_PCT=float(os.getenv('HARD_STOP_LOSS_PCT', '0.15')),
         ENABLE_EOD_EXIT=parse_bool(os.getenv('ENABLE_EOD_EXIT', 'true'), True),
         EOD_EXIT_HOUR=int(os.getenv('EOD_EXIT_HOUR', '23')),
         STRUCTURE_LOOKBACK=int(os.getenv('STRUCTURE_LOOKBACK', '6')),
