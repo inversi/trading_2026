@@ -1434,6 +1434,25 @@ class BreakoutWithATRAndRSI:
 
         return False
 
+    def _force_close_loss_positions(self, threshold_pct: float) -> None:
+        """Принудительно закрывает позиции, просившие больше порога."""
+        if threshold_pct <= 0.0:
+            return
+
+        for symbol, pos in list(self.positions.items()):
+            if pos is None or pos.qty <= 0 or pos.entry <= 0:
+                continue
+            try:
+                last_price = self.ex.last_price(symbol)
+            except Exception:
+                continue
+
+            pnl_pct = (last_price - pos.entry) / pos.entry
+            if pnl_pct <= -threshold_pct:
+                reason = f"принудительный_жесткий_стоп_{threshold_pct*100:.0f}% результат={pnl_pct:.4f}"
+                self._cancel_position(pos, reason=reason, exit_price=last_price)
+                self.losses_in_row += 1
+
     def bootstrap_existing_positions(self):
         """Сканирует свободные остатки базовых валют для всех символов и, если они есть, добавляет их как активные позиции."""
         log("Подхватываем уже существующие позиции...")
@@ -1646,6 +1665,8 @@ class BreakoutWithATRAndRSI:
         except Exception as e:
             log_error("Не удалось загрузить балансы/ордера в начале цикла", e)
             return
+
+        self._force_close_loss_positions(self.cfg.HARD_STOP_LOSS_PCT)
 
         for symbol in self.cfg.MARKETS:
             try:
