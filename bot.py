@@ -1682,11 +1682,14 @@ class BreakoutWithATRAndRSI:
         if self.cfg.MODE == 'live':
             try:
                 self.ex.cancel_all_orders(pos.symbol)
-                
+
                 qty_free = self.ex.base_free(pos.symbol)
-                if qty_free > 0:
-                    self.ex.create_market_sell(pos.symbol, qty_free)
-                    log(f"{pos.symbol}: принудительно продан остаток={qty_free:.8f}", True)
+                sell_qty = self.ex.round_qty(pos.symbol, qty_free)
+                if sell_qty > 0:
+                    self.ex.create_market_sell(pos.symbol, sell_qty)
+                    log(f"{pos.symbol}: принудительно продан остаток={sell_qty:.8f}", True)
+                else:
+                    log(f"{pos.symbol}: остаток {qty_free:.8f} слишком мал для продажи, пропускаем", True)
             except Exception as e:
                 log_error(f"{pos.symbol}: не удалось продать остаток при выходе", e)
 
