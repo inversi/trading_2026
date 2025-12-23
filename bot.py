@@ -1253,6 +1253,7 @@ class BreakoutWithATRAndRSI:
         self.current_date: date = date.today()
         self.trades_today: int = 0
         self.last_exit_bar_index: Dict[str, int] = {}  # индекс бара, на котором был выход
+        self.dust_ignore: set = set()  # символы с dust-остатками ниже minNotional
 
     def _calc_trail_profit_stop(self, pos: Position, last_price: float) -> Optional[float]:
         if not self.cfg.ENABLE_TRAIL_PROFIT:
@@ -1482,6 +1483,7 @@ class BreakoutWithATRAndRSI:
         for symbol in self.cfg.MARKETS:
             qty = self._get_total_base_from_balances(symbol, balances)
             if qty <= 0:
+                self.dust_ignore.discard(symbol)
                 continue
 
             pos = self.positions.get(symbol)
@@ -1506,6 +1508,15 @@ class BreakoutWithATRAndRSI:
             except Exception as e:
                 log_error(f"{symbol}: не удалось получить цену для принудительного стопа", e)
                 continue
+
+            min_cost = self.ex.min_order_cost_quote(symbol, fallback_price=last_price)
+            if min_cost is not None and last_price > 0:
+                notional = qty * last_price
+                if notional < float(min_cost):
+                    # Dust: один раз отмечаем, дальше молча игнорируем до роста остатка.
+                    self.dust_ignore.add(symbol)
+                    continue
+                self.dust_ignore.discard(symbol)
 
             pnl_pct = (last_price - entry_price) / entry_price
             if pnl_pct > -threshold_pct:
