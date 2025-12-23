@@ -1752,33 +1752,33 @@ class BreakoutWithATRAndRSI:
 
         self._force_close_loss_positions(self.cfg.HARD_STOP_LOSS_PCT, all_balances)
 
-            for symbol in self.cfg.MARKETS:
-                try:
-                    tf_df = self.ex.fetch_ohlcv(symbol, self.cfg.TIMEFRAME, self.cfg.LOOKBACK)
-                    # индекс бара для кулдауна (просто счётчик на основе длины df)
-                    self._bar_index = len(tf_df)
+        for symbol in self.cfg.MARKETS:
+            try:
+                tf_df = self.ex.fetch_ohlcv(symbol, self.cfg.TIMEFRAME, self.cfg.LOOKBACK)
+                # индекс бара для кулдауна (просто счётчик на основе длины df)
+                self._bar_index = len(tf_df)
                 htf_df = self.ex.fetch_ohlcv(symbol, self.cfg.FAST_HTF, max(60, int(self.cfg.LOOKBACK/5))) if self.cfg.FAST_MODE else None
-                
+
                 will_long, ctx = self._signal(symbol, tf_df, htf_df)
-                    last_close = ctx['last_close']
-                    atr_val = ctx['atr']
+                last_close = ctx['last_close']
+                atr_val = ctx['atr']
 
-                    symbol_open_orders = [o for o in all_open_orders if o.get('symbol') == symbol]
+                symbol_open_orders = [o for o in all_open_orders if o.get('symbol') == symbol]
 
-                    if symbol in self.positions:
-                        min_cost = self.ex.min_order_cost_quote(symbol, fallback_price=last_close)
-                        if min_cost is not None and last_close > 0:
-                            notional = self.positions[symbol].qty * last_close
-                            if notional < float(min_cost):
-                                if symbol not in self.dust_ignore:
-                                    log(f"{symbol}: позиция ниже minNotional, игнорируем dust", True)
-                                self.dust_ignore.add(symbol)
-                                self.positions.pop(symbol, None)
-                                continue
-                        self.dust_ignore.discard(symbol)
-
-                        if self._sync_position_after_tp(symbol, last_close, all_balances, symbol_open_orders):
+                if symbol in self.positions:
+                    min_cost = self.ex.min_order_cost_quote(symbol, fallback_price=last_close)
+                    if min_cost is not None and last_close > 0:
+                        notional = self.positions[symbol].qty * last_close
+                        if notional < float(min_cost):
+                            if symbol not in self.dust_ignore:
+                                log(f"{symbol}: позиция ниже minNotional, игнорируем dust", True)
+                            self.dust_ignore.add(symbol)
+                            self.positions.pop(symbol, None)
                             continue
+                    self.dust_ignore.discard(symbol)
+
+                    if self._sync_position_after_tp(symbol, last_close, all_balances, symbol_open_orders):
+                        continue
 
                     live_px = self.ex.last_price(symbol)
                     self._update_trailing_profit(self.positions[symbol], live_px, all_balances, symbol_open_orders)
@@ -1806,12 +1806,12 @@ class BreakoutWithATRAndRSI:
                 if will_long:
                     if self._has_position_or_pending(symbol, all_balances, symbol_open_orders):
                         continue
-                    
+
                     qty = self._position_size(symbol, last_close, all_balances)
                     if qty <= 0:
                         log(f"{symbol}: объём слишком мал", self.cfg.VERBOSE)
                         continue
-                    
+
                     pos = self._place_orders(symbol, qty, last_close, atr_val, tf_df)
                     if pos:
                         self.positions[symbol] = pos
