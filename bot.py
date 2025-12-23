@@ -1892,11 +1892,16 @@ def main():
     # Главный бесконечный цикл: на каждом шаге вызывается on_tick(),
     # после чего делается пауза SLEEP_SEC секунд.
     # Главный цикл: вызываем on_tick() с паузой SLEEP_SEC.
+    last_heartbeat_ts = time.time()
     while True:
         try:
             strat.on_tick()
         except Exception as e:
             log_error('Ошибка внутри on_tick', e)
+        now_ts = time.time()
+        if now_ts - last_heartbeat_ts >= 120:
+            log("Heartbeat: бот работает", True)
+            last_heartbeat_ts = now_ts
         time.sleep(max(1, cfg.SLEEP_SEC))
 
 if __name__ == '__main__':
