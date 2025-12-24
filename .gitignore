@@ -1,5 +1,6 @@
 # виртуальное окружение
 venv/
+.venv/
 
 # питоновский мусор
 __pycache__/
@@ -10,6 +11,8 @@ history_dump.py
 # логи и истории
 logs/
 *.log
+*.pid
+.requirements.sha256
 
 # секреты
 .env
