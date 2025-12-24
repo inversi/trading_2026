@@ -25,6 +25,11 @@
    `chmod +x trading_2026/deploy.sh`
 2) Запуск деплоя:
    `./trading_2026/deploy.sh`
+3) После правок:
+   `git add .`
+   `git commit -m "update"`
+   `git push origin main`
+   `./trading_2026/deploy.sh`
 
 ## Логи
 - `logs/app.log` — общий поток.
@@ -33,10 +38,13 @@
 - Heartbeat каждые 2 минуты: "Heartbeat: бот работает".
 
 ## Важные настройки
-- `HARD_STOP_LOSS_PCT` — жесткий стоп по просадке от входа.
-- `VERBOSE_CTX` — подробные причины "почему нет входа".
-- `MAX_LOSSES_IN_ROW` — лимит серии убытков.
-- `MAX_DAILY_DD_PCT` — дневной лимит просадки.
+- В `.env` остались инфраструктурные параметры (ключи, рынки, режим, биржа).
+- Параметры стратегии лежат в `trading_2026/strategies/*.yaml`.
+- Переключение стратегии: `STRATEGY=first` или `STRATEGY=details` в `.env`.
+
+## Стратегии
+- `trading_2026/strategies/first.yaml` — текущая стратегия (Breakout).
+- `trading_2026/strategies/details.yaml` — заготовка, пока не реализована.
 
 ## Примечания
 - Dust-остатки ниже `minNotional` игнорируются, чтобы не блокировать новые входы.

@@ -8,16 +8,17 @@ ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
-from trading_2026.config import load_config
+from trading_2026.config import load_config, load_strategy_config
 from trading_2026.exchange import Exchange, filter_markets_by_affordability
 from trading_2026.logging_utils import setup_logging, log, log_error
-from trading_2026.strategy import BreakoutWithATRAndRSI
+from trading_2026.strategy import STRATEGY_REGISTRY
 
 
 def main():
     cfg = load_config()
+    scfg = load_strategy_config(cfg.STRATEGY)
     setup_logging('logs')
-    log(f"Запуск бота — режим={cfg.MODE} рынки={cfg.MARKETS} таймфрейм={cfg.TIMEFRAME}", True)
+    log(f"Запуск бота — режим={cfg.MODE} стратегия={scfg.NAME} рынки={cfg.MARKETS} таймфрейм={scfg.TIMEFRAME}", True)
 
     if cfg.MODE == 'live' and not cfg.API_KEY:
         log('В режиме LIVE нужны API_KEY/API_SECRET в .env — остановка.', True)
@@ -43,7 +44,10 @@ def main():
     except Exception as e:
         log_error("Не удалось получить баланс/лимиты", e)
 
-    strat = BreakoutWithATRAndRSI(cfg, ex)
+    strat_cls = STRATEGY_REGISTRY.get(cfg.STRATEGY)
+    if strat_cls is None:
+        raise ValueError(f"Неизвестная стратегия: {cfg.STRATEGY}")
+    strat = strat_cls(cfg, scfg, ex)
     try:
         strat.bootstrap_existing_positions()
     except Exception as e:
