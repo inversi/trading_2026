@@ -37,7 +37,30 @@ class BreakoutWithATRAndRSI:
         self.current_date: date = date.today()
         self.trades_today: int = 0
         self.last_exit_bar_index: Dict[str, int] = {}
+        self.last_exit_bar_ts: Dict[str, datetime] = {}
         self.dust_ignore: set = set()
+        self._bar_ts: Optional[datetime] = None
+
+    def _timeframe_seconds(self) -> Optional[int]:
+        tf = str(self.scfg.TIMEFRAME or "").strip().lower()
+        if not tf:
+            return None
+        digits = ""
+        for ch in tf:
+            if ch.isdigit():
+                digits += ch
+            else:
+                break
+        unit = tf[len(digits):] if digits else tf
+        try:
+            mult = int(digits) if digits else 1
+        except Exception:
+            return None
+        units = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
+        base = units.get(unit)
+        if base is None:
+            return None
+        return mult * base
 
     def _calc_trail_profit_stop(self, pos: Position, last_price: float) -> Optional[float]:
         if not self.scfg.ENABLE_TRAIL_PROFIT:
@@ -478,7 +501,16 @@ class BreakoutWithATRAndRSI:
         quote_ccy = pos.symbol.split('/')[1]
         est_exit_px = exit_price or self.ex.last_price(pos.symbol)
         est_pnl_quote = (est_exit_px - pos.entry) * pos.qty
-        log_trade(f"ВЫХОД {pos.symbol} направление=лонг причина={reason} цена={fmt_float(est_exit_px,8)} результат={est_pnl_quote:.4f} {quote_ccy}")
+        plan_profit = None
+        if pos.tp is not None:
+            plan_profit = max(0.0, (pos.tp - pos.entry) * pos.qty)
+        plan_loss = max(0.0, (pos.entry - pos.stop) * pos.qty)
+        plan_profit_str = f"{plan_profit:.4f} {quote_ccy}" if plan_profit is not None else "нет"
+        plan_loss_str = f"{plan_loss:.4f} {quote_ccy}"
+        log_trade(
+            f"ВЫХОД {pos.symbol} направление=лонг причина={reason} цена={fmt_float(est_exit_px,8)} "
+            f"результат={est_pnl_quote:.4f} {quote_ccy} план_прибыль={plan_profit_str} план_убыток={plan_loss_str}"
+        )
 
         if self.cfg.MODE == 'live':
             try:
@@ -495,6 +527,10 @@ class BreakoutWithATRAndRSI:
             self.last_exit_bar_index[pos.symbol] = int(self._bar_index)
         except Exception:
             self.last_exit_bar_index[pos.symbol] = 0
+        try:
+            self.last_exit_bar_ts[pos.symbol] = self._bar_ts or datetime.utcnow()
+        except Exception:
+            self.last_exit_bar_ts[pos.symbol] = datetime.utcnow()
 
     def on_tick(self):
         self._reset_daily_limits_if_new_day()
@@ -515,6 +551,13 @@ class BreakoutWithATRAndRSI:
             try:
                 tf_df = self.ex.fetch_ohlcv(symbol, self.scfg.TIMEFRAME, self.scfg.LOOKBACK)
                 self._bar_index = len(tf_df)
+                if len(tf_df) > 0:
+                    try:
+                        self._bar_ts = tf_df.iloc[-1]["ts"].to_pydatetime()
+                    except Exception:
+                        self._bar_ts = None
+                else:
+                    self._bar_ts = None
                 htf_df = self.ex.fetch_ohlcv(symbol, self.scfg.FAST_HTF, max(60, int(self.scfg.LOOKBACK / 5))) if self.scfg.FAST_MODE else None
 
                 will_long, ctx = self._signal(symbol, tf_df, htf_df)
@@ -550,10 +593,20 @@ class BreakoutWithATRAndRSI:
                         continue
 
                 if self.scfg.COOLDOWN_BARS and self.scfg.COOLDOWN_BARS > 0:
-                    last_exit_idx = self.last_exit_bar_index.get(symbol)
-                    if last_exit_idx is not None and (self._bar_index - int(last_exit_idx)) < int(self.scfg.COOLDOWN_BARS):
-                        log(f"{symbol}: пропуск — кулдаун {self.scfg.COOLDOWN_BARS} баров после выхода", self.cfg.VERBOSE)
-                        continue
+                    cooldown_bars = int(self.scfg.COOLDOWN_BARS)
+                    tf_seconds = self._timeframe_seconds()
+                    last_exit_ts = self.last_exit_bar_ts.get(symbol)
+                    if self._bar_ts is not None and last_exit_ts is not None and tf_seconds and tf_seconds > 0:
+                        elapsed = (self._bar_ts - last_exit_ts).total_seconds()
+                        bars_since = int(elapsed // tf_seconds) if elapsed > 0 else 0
+                        if bars_since < cooldown_bars:
+                            log(f"{symbol}: пропуск — кулдаун {self.scfg.COOLDOWN_BARS} баров после выхода", self.cfg.VERBOSE)
+                            continue
+                    else:
+                        last_exit_idx = self.last_exit_bar_index.get(symbol)
+                        if last_exit_idx is not None and (self._bar_index - int(last_exit_idx)) < cooldown_bars:
+                            log(f"{symbol}: пропуск — кулдаун {self.scfg.COOLDOWN_BARS} баров после выхода", self.cfg.VERBOSE)
+                            continue
 
                 if self.losses_in_row >= self.scfg.MAX_LOSSES_IN_ROW:
                     log(f"{symbol}: пропуск (серия убыточных {self.losses_in_row} >= {self.scfg.MAX_LOSSES_IN_ROW})", self.cfg.VERBOSE)
@@ -571,7 +624,18 @@ class BreakoutWithATRAndRSI:
                     pos = self._place_orders(symbol, qty, last_close, atr_val, tf_df)
                     if pos:
                         self.positions[symbol] = pos
-                        log_trade(f"ВХОД {symbol} направление=лонг объём={pos.qty:.8f} вход={fmt_float(pos.entry, 8)} стоп={fmt_float(pos.stop, 8)} тейк={fmt_float(pos.tp, 8) if pos.tp else 'нет'}")
+                        quote_ccy = symbol.split('/')[1]
+                        plan_profit = None
+                        if pos.tp is not None:
+                            plan_profit = max(0.0, (pos.tp - pos.entry) * pos.qty)
+                        plan_loss = max(0.0, (pos.entry - pos.stop) * pos.qty)
+                        plan_profit_str = f"{plan_profit:.4f} {quote_ccy}" if plan_profit is not None else "нет"
+                        plan_loss_str = f"{plan_loss:.4f} {quote_ccy}"
+                        log_trade(
+                            f"ВХОД {symbol} направление=лонг объём={pos.qty:.8f} вход={fmt_float(pos.entry, 8)} "
+                            f"стоп={fmt_float(pos.stop, 8)} тейк={fmt_float(pos.tp, 8) if pos.tp else 'нет'} "
+                            f"план_прибыль={plan_profit_str} план_убыток={plan_loss_str}"
+                        )
                         self.trades_today += 1
                     else:
                         log(f"{symbol}: не удалось выставить ордер", True)

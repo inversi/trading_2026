@@ -218,24 +218,50 @@ class Exchange:
         except Exception:
             return 0.0
 
-    def avg_buy_price(self, symbol: str, lookback_days: int = 30) -> Optional[float]:
+    def avg_buy_price(self, symbol: str, lookback_days: int = 180) -> Optional[float]:
         try:
             since_ms = int((datetime.now(timezone.utc).timestamp() - lookback_days * 86400) * 1000)
             trades = self.ccxt.fetch_my_trades(symbol, since=since_ms)
             buys = [t for t in trades if str(t.get('side')) == 'buy']
             if not buys:
-                return None
+                buys = []
             cost = 0.0
             amount = 0.0
-            for t in buys:
-                px = float(t.get('price') or 0.0)
-                qty = float(t.get('amount') or 0.0)
-                if px > 0 and qty > 0:
-                    cost += px * qty
-                    amount += qty
+            if buys:
+                for t in buys:
+                    px = float(t.get('price') or 0.0)
+                    qty = float(t.get('amount') or 0.0)
+                    if px > 0 and qty > 0:
+                        cost += px * qty
+                        amount += qty
+            if amount > 0:
+                avg = cost / amount
+                log(f"{symbol}: avg_buy_price из trades за {lookback_days}d = {avg:.8f}", True)
+                return avg
+
+            orders = self.ccxt.fetch_orders(symbol, since=since_ms)
+            for o in orders or []:
+                if str(o.get('side')) != 'buy':
+                    continue
+                status = str(o.get('status') or '').lower()
+                if status and status not in ('closed', 'filled'):
+                    continue
+                filled = float(o.get('filled') or 0.0)
+                if filled <= 0:
+                    continue
+                avg_px = float(o.get('average') or 0.0)
+                cost_val = float(o.get('cost') or 0.0)
+                if avg_px > 0:
+                    cost += avg_px * filled
+                    amount += filled
+                elif cost_val > 0:
+                    cost += cost_val
+                    amount += filled
             if amount <= 0:
                 return None
-            return cost / amount
+            avg = cost / amount
+            log(f"{symbol}: avg_buy_price из orders за {lookback_days}d = {avg:.8f}", True)
+            return avg
         except Exception:
             return None
 
