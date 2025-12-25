@@ -6,7 +6,10 @@ venv/
 __pycache__/
 *.pyc
 Comm.txt
+
+# разное
 history_dump.py
+deploy.sh
 
 # логи и истории
 logs/

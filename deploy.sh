@@ -44,11 +44,17 @@ if [ -f "${REQ_HASH_FILE}" ]; then
   PREV_HASH=$(cat "${REQ_HASH_FILE}")
 fi
 if [ "${REQ_HASH}" != "${PREV_HASH}" ]; then
-  "${PIP_BIN}" install -r "${REQ_FILE}"
+  PIP_LOG=$(mktemp)
+  if ! "${PIP_BIN}" install -r "${REQ_FILE}" >"${PIP_LOG}" 2>&1; then
+    echo "Requirements - failed"
+    tail -n 50 "${PIP_LOG}" || true
+    rm -f "${PIP_LOG}"
+    exit 1
+  fi
+  rm -f "${PIP_LOG}"
   echo "${REQ_HASH}" > "${REQ_HASH_FILE}"
-else
-  echo "requirements.txt не изменился"
 fi
+echo "Requirements - ok"
 
 echo "==> stop bot (if running)"
 if [ -f "${PID_FILE}" ]; then
