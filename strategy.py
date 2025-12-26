@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # Торговая стратегия и управление позициями.
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -650,6 +650,77 @@ class BreakoutWithATRAndRSI:
                 continue
 
 
+class VolatilityDailyStrategy(BreakoutWithATRAndRSI):
+    def _estimate_day_profit(self, qty: float, atr_val: float) -> Optional[float]:
+        if qty <= 0 or atr_val <= 0:
+            return None
+        tf_seconds = self._timeframe_seconds()
+        if not tf_seconds or tf_seconds <= 0:
+            return None
+        base_ts = self._bar_ts or datetime.utcnow()
+        end_day = base_ts.replace(hour=23, minute=59, second=59, microsecond=0)
+        if base_ts > end_day:
+            end_day = end_day + timedelta(days=1)
+        remaining_sec = max(0.0, (end_day - base_ts).total_seconds())
+        remaining_bars = max(1, int(remaining_sec // tf_seconds))
+        return atr_val * remaining_bars * qty
+
+    def _signal(self, symbol: str, tf_df: pd.DataFrame, htf_df: Optional[pd.DataFrame]) -> Tuple[bool, Dict]:
+        df = tf_df.copy()
+        df['sma20'] = sma(df['close'], 20)
+        df['atr'] = atr(df, 14)
+        df['atr_pct'] = df['atr'] / df['close']
+
+        last = df.iloc[-1]
+        atr_ok = self.scfg.ATR_PCT_MIN <= float(last['atr_pct']) <= self.scfg.ATR_PCT_MAX
+        trend_ok = float(last['close']) >= float(last['sma20'])
+        will_long = bool(atr_ok and trend_ok)
+        ctx = {
+            'last_close': float(last['close']),
+            'atr': float(last['atr']),
+            'atr_pct': float(last['atr_pct']),
+            'atr_ok': atr_ok,
+            'trend_ok': trend_ok,
+        }
+        return will_long, ctx
+
+    def _place_orders(self, symbol: str, qty: float, entry: float, atr_val: float, tf_df: pd.DataFrame) -> Optional[Position]:
+        if qty <= 0 or entry <= 0:
+            return None
+
+        loss_per_unit = 1.0 / max(qty, 1e-12)
+        desired_stop = entry - loss_per_unit
+        if desired_stop <= 0:
+            log(f"{symbol}: пропуск — стоп <= 0 при расчёте лимита убытка 1€", self.cfg.VERBOSE)
+            return None
+
+        minp = self.ex.min_price(symbol)
+        stop_floor = max(minp, entry * (1.0 - self.scfg.STOP_MAX_PCT))
+        stop = max(desired_stop, stop_floor)
+
+        est_profit = self._estimate_day_profit(qty, atr_val)
+        if est_profit is not None and est_profit < 1.0:
+            log(f"{symbol}: пропуск — потенц. прибыль за день {est_profit:.4f} < 1€", self.cfg.VERBOSE)
+            return None
+
+        tp = entry + loss_per_unit if self.scfg.USE_TP else None
+
+        if self.cfg.MODE == 'paper':
+            return Position(symbol, 'long', qty, entry, stop, tp)
+
+        buy = self.ex.create_market_buy(symbol, qty)
+        filled_qty = float(buy.get('filled') or qty)
+        filled_price = float(buy.get('average', buy.get('price', entry)) or entry)
+
+        loss_per_unit = 1.0 / max(filled_qty, 1e-12)
+        desired_stop = filled_price - loss_per_unit
+        stop_floor = max(minp, filled_price * (1.0 - self.scfg.STOP_MAX_PCT))
+        stop = max(desired_stop, stop_floor)
+        tp = filled_price + loss_per_unit if self.scfg.USE_TP else None
+
+        return Position(symbol, 'long', filled_qty, filled_price, stop, tp)
+
+
 class DetailsStrategy:
     def __init__(self, cfg: Config, scfg: StrategyConfig, ex: Exchange):
         self.cfg = cfg
@@ -671,4 +742,5 @@ class DetailsStrategy:
 STRATEGY_REGISTRY = {
     "first": BreakoutWithATRAndRSI,
     "details": DetailsStrategy,
+    "second": VolatilityDailyStrategy,
 }

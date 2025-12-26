@@ -26,6 +26,7 @@ class Exchange:
         })
         self.markets = self._call_with_retries("load_markets", self.ccxt.load_markets)
         self.has_oco = bool(getattr(self.ccxt, 'has', {}).get('createOrderOCO', False))
+        self._avg_buy_price_logged = set()
 
     def _call_with_retries(self, name: str, fn, *args, **kwargs):
         retry_count = max(1, int(getattr(self.cfg, "CCXT_RETRY_COUNT", 3) or 1))
@@ -236,7 +237,9 @@ class Exchange:
                         amount += qty
             if amount > 0:
                 avg = cost / amount
-                log(f"{symbol}: avg_buy_price из trades за {lookback_days}d = {avg:.8f}", True)
+                if symbol not in self._avg_buy_price_logged:
+                    log(f"{symbol}: avg_buy_price из trades за {lookback_days}d = {avg:.8f}", True)
+                    self._avg_buy_price_logged.add(symbol)
                 return avg
 
             orders = self.ccxt.fetch_orders(symbol, since=since_ms)
@@ -260,7 +263,9 @@ class Exchange:
             if amount <= 0:
                 return None
             avg = cost / amount
-            log(f"{symbol}: avg_buy_price из orders за {lookback_days}d = {avg:.8f}", True)
+            if symbol not in self._avg_buy_price_logged:
+                log(f"{symbol}: avg_buy_price из orders за {lookback_days}d = {avg:.8f}", True)
+                self._avg_buy_price_logged.add(symbol)
             return avg
         except Exception:
             return None
